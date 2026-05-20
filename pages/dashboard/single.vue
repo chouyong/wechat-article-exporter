@@ -375,6 +375,9 @@ const selectedArticles = shallowRef<SingleArticleRow[]>([]);
 function onSelectionChanged(event: SelectionChangedEvent) {
   selectedArticles.value = (event.selectedNodes || []).map(node => node.data);
 }
+function refreshSelectedArticles() {
+  triggerRef(selectedArticles);
+}
 const selectedArticleUrls = computed(() => {
   return selectedArticles.value.map(article => article.link);
 });
@@ -393,6 +396,7 @@ const {
     if (article) {
       article.fakeid = fakeid;
       updateRow(article);
+      refreshSelectedArticles();
 
       updateArticleFakeid(url, fakeid);
     }
@@ -411,6 +415,7 @@ const {
       await articleDeleted(url, false);
 
       updateRow(article);
+      refreshSelectedArticles();
     } else {
       console.warn(`${url} not found in table data when update contentDownload`);
     }
@@ -420,6 +425,7 @@ const {
     if (article) {
       article._status = status;
       updateRow(article);
+      refreshSelectedArticles();
 
       updateArticleStatus(url, status);
     }
@@ -430,6 +436,7 @@ const {
       article.is_deleted = true;
       article._status = '已删除';
       updateRow(article);
+      refreshSelectedArticles();
 
       updateArticleStatus(url, '已删除');
       articleDeleted(url);
@@ -456,6 +463,7 @@ const {
       }
 
       updateRow(article);
+      refreshSelectedArticles();
     } else {
       console.warn(`${url} not found in table data when update metadata`);
     }
@@ -465,6 +473,7 @@ const {
     if (article) {
       article.commentDownload = true;
       updateRow(article);
+      refreshSelectedArticles();
     } else {
       console.warn(`${url} not found in table data when update commentDownload`);
     }
