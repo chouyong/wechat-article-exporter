@@ -198,6 +198,29 @@ try {
   const resumed = jobs.markAccountRunning('job-restart', 'p');
   check('12. interrupted 续跑到 running', resumed.status === 'running');
 
+  // ── 13. failed_only 重试：re-finalize 刷新 finished_at（startJob 清旧终态时间戳）──
+  const jrt = jobs.createSyncJob({ id: 'job-retry-ts', accounts: [{ fakeid: 'p' }, { fakeid: 'q' }] });
+  jobs.startJob('job-retry-ts');
+  jobs.markAccountRunning('job-retry-ts', 'p');
+  jobs.applyAccountOutcome('job-retry-ts', 'p', { status: 'succeeded' });
+  jobs.markAccountRunning('job-retry-ts', 'q');
+  jobs.applyAccountOutcome('job-retry-ts', 'q', { status: 'failed', errorCode: 'x' });
+  const firstFinal = jobs.finalizeJob('job-retry-ts');
+  check(
+    '13. 首次 finalize -> partial 且有 finished_at',
+    firstFinal.status === 'partial' && firstFinal.finishedAt !== null
+  );
+  jobs.resetFailedAccounts('job-retry-ts');
+  const rerun = jobs.startJob('job-retry-ts'); // partial -> running，清 finished_at
+  check('13. 重跑 startJob 清空 finished_at（不再是已完成）', rerun.finishedAt === null);
+  jobs.markAccountRunning('job-retry-ts', 'q');
+  jobs.applyAccountOutcome('job-retry-ts', 'q', { status: 'succeeded' });
+  const reFinal = jobs.finalizeJob('job-retry-ts');
+  check('13. 重试后 re-finalize -> completed', reFinal.status === 'completed');
+  // 核心 fix-must-fail 在上一句「rerun.finishedAt === null」：无 startJob 清空则此处仍是首次陈旧值。
+  // 经 NULL 后 COALESCE(NULL, now) 必写新鲜值，故只断言非 null（不比较字符串，避免同毫秒 flaky）。
+  check('13. re-finalize 写入新鲜 finished_at（经 NULL 后重置）', reFinal.finishedAt !== null);
+
   console.log(`\nPASS smoke_mp_sync_jobs: ${passed} assertions`);
 } catch (err) {
   console.error('FAIL smoke_mp_sync_jobs:', err && err.stack ? err.stack : err);

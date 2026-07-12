@@ -278,18 +278,19 @@ export function createSyncJob(input: CreateSyncJobInput): MpSyncJob {
   return selectJob(db, id) as MpSyncJob;
 }
 
-/** queued -> running。已 running 幂等返回；其它非法迁移抛错。 */
+/**
+ * queued -> running（也含 failed_only 重试的 partial/failed -> running）。已 running 幂等返回；其它非法迁移抛错。
+ * 进入 running 时清 finished_at：重试重跑的任务不再是“已完成”，避免 re-finalize 因 COALESCE 保留首次终态时间戳而失真。
+ */
 export function startJob(id: string): MpSyncJob {
   const db = getMpSyncDatabase();
   const job = selectJob(db, id);
   if (!job) throw new Error(`mp_sync_job not found: ${id}`);
   if (job.status === 'running') return job;
   assertJobTransition(job.status, 'running');
-  db.prepare('UPDATE mp_sync_jobs SET status = ?, started_at = COALESCE(started_at, ?) WHERE id = ?').run(
-    'running',
-    nowIso(),
-    id
-  );
+  db.prepare(
+    'UPDATE mp_sync_jobs SET status = ?, started_at = COALESCE(started_at, ?), finished_at = NULL WHERE id = ?'
+  ).run('running', nowIso(), id);
   return selectJob(db, id) as MpSyncJob;
 }
 
