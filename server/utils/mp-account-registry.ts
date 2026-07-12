@@ -72,6 +72,14 @@ type SqliteRow = Record<string, unknown>;
 const SCHEMA_VERSION = 1;
 const DEFAULT_DB_PATH = path.resolve(process.cwd(), '.data', 'kv', 'mp-sync.sqlite');
 
+/**
+ * 合法 epoch 秒上界。JS Date 可表示范围是 ±8.64e15 ms（约 ±271821 年）；epoch 秒 * 1000
+ * 必须落在此范围内，否则 `new Date(sec * 1000).toISOString()` 抛原生 RangeError。
+ * 作为「可转换 epoch 秒」的单一事实源：API schema（mp-account-api.ts）与本模块
+ * epochToIso() 共用，保证两层校验口径一致（Codex C1-F1）。
+ */
+export const MAX_EPOCH_SECONDS = 8_640_000_000_000; // 8.64e12 秒；* 1000 = 8.64e15 ms = Date 上界
+
 let database: DatabaseSync | null = null;
 let openedPath: string | null = null;
 
@@ -154,6 +162,9 @@ function nullableText(value: string | null | undefined) {
 function epochToIso(value: number | null | undefined) {
   if (value === undefined) return undefined;
   if (value === null) return null;
+  // 防御纵深：越界 / 非有限 epoch（绕过 API 校验的内部调用）降级为 null，
+  // 不再让 new Date().toISOString() 抛原生 RangeError 拖垮整批 upsert（Codex C1-F1 §3.3.2）。
+  if (!Number.isFinite(value) || Math.abs(value) > MAX_EPOCH_SECONDS) return null;
   return new Date(value * 1000).toISOString();
 }
 

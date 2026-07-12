@@ -9,7 +9,8 @@
 //
 // 无新增依赖：仅用 Node 内置 fetch / node:net / node:child_process / node:assert。
 // 运行：先 `yarn build`，再 `node tools/smoke_mp_account_api_http.mjs`
-//   （Node 22.x 需 `--experimental-sqlite`；Node ≥23 免 flag。子进程一律带该 flag，向前兼容。）
+//   子进程一律带 `--experimental-sqlite`（向前兼容）；实测真实 Node 22.20.0 无此 flag 也能
+//   启动构建产物（仅一条 ExperimentalWarning），Node ≥23 该能力已默认开启。
 
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
@@ -251,6 +252,48 @@ async function main() {
       imp1rec && imp1rec.last_synced_at === new Date(1700000000 * 1000).toISOString()
     );
     check('6. source 归一 browser_import', imp1rec && imp1rec.source === 'browser_import');
+
+    // ── 用例 7：越界 epoch → invalid（fix-must-fail：修复前此处必红=500）──
+    // last_update_time 超出 JS Date 可转换范围（> 8.64e12 秒）。修复前 epochToIso 在
+    // 事务内抛原生 RangeError → 整批回滚 → HTTP 500，绕过 invalidItems 契约；
+    // 修复后越界 item 落 invalidItems、整批仍 200，合法项照常入库、映射不变。
+    const overflow = await req('POST', '/api/tools/mp-accounts/import-browser', {
+      accounts: [
+        { fakeid: 'imp-good-epoch', nickname: '正常时间戳', last_update_time: 1700000000 },
+        { fakeid: 'imp-overflow', nickname: '越界时间戳', last_update_time: 999999999999999 },
+      ],
+    });
+    check('7. 越界 epoch 混批 → 200（非 500）', overflow.status === 200);
+    check('7. 越界 item 计入 invalid=1', overflow.json && overflow.json.invalid === 1);
+    check(
+      '7. invalidItems 指向越界项(index=1)',
+      overflow.json &&
+        Array.isArray(overflow.json.invalidItems) &&
+        overflow.json.invalidItems.length === 1 &&
+        overflow.json.invalidItems[0].index === 1
+    );
+    check('7. 合法 epoch 项仍 inserted=1', overflow.json && overflow.json.inserted === 1);
+    const afterOverflow = await req('GET', '/api/tools/mp-accounts');
+    check('7. 只落合法项 → total=7', afterOverflow.json.total === 7);
+    const expAfterOverflow = await req('GET', '/api/tools/mp-accounts/export');
+    const goodEpochRec = expAfterOverflow.json.accounts.find(a => a.fakeid === 'imp-good-epoch');
+    check(
+      '7. 合法 browser epoch 映射不变(ISO)',
+      goodEpochRec && goodEpochRec.last_synced_at === new Date(1700000000 * 1000).toISOString()
+    );
+    check('7. 越界项未落库', !expAfterOverflow.json.accounts.some(a => a.fakeid === 'imp-overflow'));
+
+    // ── 用例 8：坏 envelope / 坏 query → 400（契约固化，Codex §3.3.4）──────
+    const badBatch = await req('POST', '/api/tools/mp-accounts/batch', { accounts: 'not-an-array' });
+    check('8. batch accounts 非数组 → 400', badBatch.status === 400);
+    const badImport = await req('POST', '/api/tools/mp-accounts/import-browser', { accounts: { nope: true } });
+    check('8. import-browser accounts 非数组 → 400', badImport.status === 400);
+    const badQueryPageSize = await req('GET', '/api/tools/mp-accounts?pageSize=abc');
+    check('8. list 坏 query(pageSize=abc) → 400', badQueryPageSize.status === 400);
+    const badQueryMinPri = await req('GET', '/api/tools/mp-accounts?minPriority=not-a-number');
+    check('8. list 坏 query(minPriority) → 400', badQueryMinPri.status === 400);
+    const tooBigPageSize = await req('GET', '/api/tools/mp-accounts?pageSize=99999');
+    check('8. list pageSize>500 → 400', tooBigPageSize.status === 400);
 
     console.log(`PASS smoke_mp_account_api_http: ${passed} assertions`);
   } finally {

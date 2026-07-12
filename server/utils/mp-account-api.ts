@@ -1,5 +1,6 @@
 import { createError } from 'h3';
 import { z } from 'zod';
+import { MAX_EPOCH_SECONDS } from '~/server/utils/mp-account-registry';
 import type { MpAccountSource, MpAccountUpsertInput } from '~/server/utils/mp-account-registry';
 
 /**
@@ -19,6 +20,18 @@ export function parseOr400<T>(schema: z.ZodType<T>, data: unknown): T {
 
 const sourceSchema = z.enum(['browser_import', 'manual', 'api', 'auto_detect']);
 
+// epoch 秒字段共用约束：非负整数且 ≤ MAX_EPOCH_SECONDS（可转换为 JS Date 的上界）。
+// 越界值经此 schema 落 invalidItems/400，而非在 repository 的 epochToIso 处冒泡 500
+// （Codex C1-F1 §3.3.1）。last_article_time 虽当前不经 Date 转换，同为 epoch 秒，
+// 用同一口径约束以保持契约一致；真实数据（~1.7e9）远低于上界，零影响。
+const epochSecondsSchema = z
+  .number()
+  .int()
+  .nonnegative()
+  .max(MAX_EPOCH_SECONDS, { message: `epoch 秒超出可转换范围（> ${MAX_EPOCH_SECONDS}）` })
+  .nullable()
+  .optional();
+
 export const mpAccountInputSchema = z.object({
   fakeid: z.string().trim().min(1).max(256),
   nickname: z.string().max(512).nullable().optional(),
@@ -31,9 +44,9 @@ export const mpAccountInputSchema = z.object({
   source: sourceSchema.optional(),
   reported_total_count: z.number().int().nonnegative().nullable().optional(),
   total_count: z.number().int().nonnegative().nullable().optional(),
-  last_article_time: z.number().int().nonnegative().nullable().optional(),
+  last_article_time: epochSecondsSchema,
   last_synced_at: z.string().datetime({ offset: true }).nullable().optional(),
-  last_update_time: z.number().int().nonnegative().nullable().optional(),
+  last_update_time: epochSecondsSchema,
 });
 
 export const mpAccountBatchSchema = z.object({
