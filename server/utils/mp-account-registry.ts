@@ -69,7 +69,9 @@ export interface MpAccountBatchResult {
 
 type SqliteRow = Record<string, unknown>;
 
-const SCHEMA_VERSION = 1;
+// v1：mp_accounts 账号注册表（C1）。v2：mp_sync_jobs / mp_sync_job_accounts 后台同步任务持久层（C2）。
+// 同一 SQLite 文件共用一条迁移链与一个降级守卫；jobs 仓库（mp-sync-job-registry.ts）复用 getMpSyncDatabase()。
+const SCHEMA_VERSION = 2;
 const DEFAULT_DB_PATH = path.resolve(process.cwd(), '.data', 'kv', 'mp-sync.sqlite');
 
 /**
@@ -134,6 +136,56 @@ function migrate(db: DatabaseSync) {
       COMMIT;
     `);
   }
+  if (currentVersion < 2) {
+    // C2：后台增量同步任务持久层。任务与逐账号状态必须落盘，服务重启后从这两张表恢复，不靠进程内 Map。
+    db.exec(`
+      BEGIN IMMEDIATE;
+      CREATE TABLE IF NOT EXISTS mp_sync_jobs (
+        id TEXT PRIMARY KEY,
+        status TEXT NOT NULL DEFAULT 'queued'
+          CHECK (status IN ('queued', 'running', 'completed', 'partial', 'failed', 'cancelled')),
+        mode TEXT NOT NULL DEFAULT 'incremental'
+          CHECK (mode IN ('incremental', 'full', 'failed_only')),
+        idempotency_key TEXT UNIQUE,
+        requested_since INTEGER,
+        total_accounts INTEGER NOT NULL DEFAULT 0,
+        processed_accounts INTEGER NOT NULL DEFAULT 0,
+        succeeded_accounts INTEGER NOT NULL DEFAULT 0,
+        failed_accounts INTEGER NOT NULL DEFAULT 0,
+        new_articles INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        finished_at TEXT,
+        cancel_requested_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS mp_sync_job_accounts (
+        job_id TEXT NOT NULL,
+        fakeid TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending'
+          CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'auth_required', 'interrupted', 'cancelled')),
+        priority INTEGER NOT NULL DEFAULT 0,
+        page_cursor INTEGER NOT NULL DEFAULT 0,
+        since_time INTEGER,
+        last_article_time INTEGER,
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        new_articles INTEGER NOT NULL DEFAULT 0,
+        error_code TEXT,
+        error_message TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        started_at TEXT,
+        finished_at TEXT,
+        PRIMARY KEY (job_id, fakeid),
+        FOREIGN KEY (job_id) REFERENCES mp_sync_jobs(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_mp_sync_jobs_status
+        ON mp_sync_jobs(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_mp_sync_job_accounts_status
+        ON mp_sync_job_accounts(job_id, status, priority DESC);
+      PRAGMA user_version = 2;
+      COMMIT;
+    `);
+  }
 }
 
 export function initializeMpAccountRegistry(databasePath?: string) {
@@ -151,6 +203,14 @@ export function closeMpAccountRegistry() {
 function getDatabase() {
   initializeMpAccountRegistry();
   return database as DatabaseSync;
+}
+
+/**
+ * 共享数据库访问器：C2 的 mp-sync-job-registry.ts 复用同一连接与迁移链，
+ * 避免对同一 SQLite 文件开多个连接造成锁竞争。首次调用触发 initialize + migrate（含 v2 jobs 表）。
+ */
+export function getMpSyncDatabase(): DatabaseSync {
+  return getDatabase();
 }
 
 function nullableText(value: string | null | undefined) {
