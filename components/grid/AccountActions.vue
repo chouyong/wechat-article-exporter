@@ -8,7 +8,7 @@ interface Props {
     onStop?: (params: ICellRendererParams) => void;
     isDeleting: boolean;
     isSyncing: boolean;
-    syncingRowId: string | null;
+    syncingRowIds: string[];
   };
 }
 const props = defineProps<Props>();
@@ -20,7 +20,9 @@ function stop() {
   props.params.onStop && props.params.onStop(props.params);
 }
 const isDisabled = computed(() => props.params.isDeleting || props.params.isSyncing);
-const isLoading = computed(() => props.params.isSyncing && props.params.node.id === props.params.syncingRowId);
+const isLoading = computed(
+  () => props.params.isSyncing && props.params.syncingRowIds.includes(String(props.params.node.id)),
+);
 </script>
 
 <template>

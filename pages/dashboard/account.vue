@@ -11,7 +11,7 @@ import type {
 } from 'ag-grid-community';
 import { AgGridVue } from 'ag-grid-vue3';
 import { defu } from 'defu';
-import { formatTimeStamp } from '#shared/utils/helpers';
+import { formatTimeStamp, sleep } from '#shared/utils/helpers';
 import { getArticleList } from '~/apis';
 import GlobalSearchAccountDialog from '~/components/global/SearchAccountDialog.vue';
 import GridAccountActions from '~/components/grid/AccountActions.vue';
@@ -42,6 +42,7 @@ interface PromiseInstance {
 const toast = toastFactory();
 const modal = useModal();
 const { checkLogin } = useLoginCheck();
+const route = useRoute();
 
 const { getSyncTimestamp, getSyncRangeLabel, isSyncAll } = useSyncDeadline();
 const syncToTimestamp = getSyncTimestamp();
@@ -79,31 +80,32 @@ const isCanceled = ref(false);
 const isDeleting = ref(false);
 const isSyncing = ref(false);
 
-// 当前正在同步的公众号id
-const syncingRowId = ref<string | null>(null);
+const syncingRowIds = ref<string[]>([]);
+const ACCOUNT_SYNC_CONCURRENCY = 4;
 
-const syncTimer = ref<number | null>(null);
+function markAccountSyncing(fakeid: string) {
+  if (!syncingRowIds.value.includes(fakeid)) {
+    syncingRowIds.value = [...syncingRowIds.value, fakeid];
+  }
+}
+
+function unmarkAccountSyncing(fakeid: string) {
+  syncingRowIds.value = syncingRowIds.value.filter(id => id !== fakeid);
+}
 
 async function _load(account: MpAccount, begin: number, loadMore: boolean, promise: PromiseInstance) {
   if (isCanceled.value) {
-    isCanceled.value = false; // 这里需要将状态复位
     promise.reject(new Error('已取消同步'));
     return;
   }
 
-  syncingRowId.value = account.fakeid;
-  isSyncing.value = true;
-
   const [articles, completed] = await getArticleList(account, begin);
   if (isCanceled.value) {
-    isCanceled.value = false;
     promise.reject(new Error('已取消同步'));
     return;
   }
   if (completed) {
     await updateRow(account.fakeid);
-    syncingRowId.value = null;
-    isSyncing.value = false;
     promise.resolve(account);
     return;
   }
@@ -132,40 +134,50 @@ async function _load(account: MpAccount, begin: number, loadMore: boolean, promi
 
   await updateRow(account.fakeid);
   if (loadMore) {
-    syncTimer.value = window.setTimeout(
-      () => {
-        if (isCanceled.value) {
-          console.warn('已取消同步');
-          isCanceled.value = false;
-          promise.reject(new Error('已取消同步'));
-          return;
-        }
-        _load(account, begin, true, promise);
-      },
-      ((preferences.value as unknown as Preferences).accountSyncSeconds || 5) * 1000
-    );
+    await sleep(((preferences.value as unknown as Preferences).accountSyncSeconds || 3) * 1000);
+    if (isCanceled.value) {
+      promise.reject(new Error('已取消同步'));
+      return;
+    }
+    await _load(account, begin, true, promise);
   } else {
-    syncingRowId.value = null;
-    isSyncing.value = false;
     promise.resolve(account);
   }
 }
 
 // 同步指定公众号
 async function loadAccountArticle(account: MpAccount, loadMore = true) {
+  markAccountSyncing(account.fakeid);
+  isSyncing.value = true;
   return new Promise((resolve, reject) => {
     const promise: PromiseInstance = { resolve, reject };
 
     _load(account, 0, loadMore, promise).catch(e => {
-      syncingRowId.value = null;
-      isSyncing.value = false;
-
       if (e.message === 'session expired') {
         modal.open(LoginModal);
       }
       reject(e);
+    }).finally(() => {
+      unmarkAccountSyncing(account.fakeid);
+      isSyncing.value = syncingRowIds.value.length > 0;
     });
   });
+}
+
+async function runAccountSyncBatch(accounts: MpAccount[], concurrency: number) {
+  const queue = [...accounts];
+  const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
+    while (queue.length > 0) {
+      if (isCanceled.value) {
+        throw new Error('已取消同步');
+      }
+      const account = queue.shift();
+      if (!account) return;
+      await loadAccountArticle(account);
+    }
+  });
+
+  await Promise.all(workers);
 }
 
 // 同步所有公众号
@@ -173,16 +185,19 @@ async function loadSelectedAccountArticle() {
   if (!checkLogin()) return;
 
   isCanceled.value = false;
+  isSyncing.value = true;
 
   try {
     const rows = getSelectedRows();
-    for (const account of rows) {
-      await loadAccountArticle(account);
-    }
+    await runAccountSyncBatch(rows, ACCOUNT_SYNC_CONCURRENCY);
     const rangeHint = isSyncAll() ? '' : `（同步范围：${getSyncRangeLabel()}）`;
     toast.success('同步完成', `已成功同步 ${rows.length} 个公众号${rangeHint}`);
   } catch (e: any) {
     toast.error('同步失败', e.message);
+  } finally {
+    isSyncing.value = false;
+    syncingRowIds.value = [];
+    isCanceled.value = false;
   }
 }
 
@@ -320,19 +335,12 @@ const columnDefs = ref<ColDef[]>([
             toast.error('同步失败', e.message);
           });
       },
-      onStop: (params: ICellRendererParams) => {
+      onStop: (_params: ICellRendererParams) => {
         isCanceled.value = true;
-        if (syncTimer.value) {
-          window.clearTimeout(syncTimer.value);
-          syncTimer.value = null;
-        }
-
-        syncingRowId.value = null;
-        isSyncing.value = false;
       },
       isDeleting: isDeleting,
       isSyncing: isSyncing,
-      syncingRowId: syncingRowId,
+      syncingRowIds: syncingRowIds,
     },
     cellClass: 'flex justify-center items-center',
     maxWidth: 100,
@@ -484,6 +492,15 @@ function exportAccount() {
 }
 
 const { getActualDateRange } = useSyncDeadline();
+
+onMounted(async () => {
+  const imported = route.query.imported;
+  if (!imported) return;
+
+  const importedCount = Array.isArray(imported) ? imported[0] : imported;
+  toast.success('导入完成', `已导入 ${importedCount} 个账号`);
+  await navigateTo('/dashboard/account', { replace: true });
+});
 </script>
 
 <template>
