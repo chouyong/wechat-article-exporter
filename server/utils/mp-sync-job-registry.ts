@@ -88,7 +88,7 @@ export interface AccountOutcomeInput {
 const JOB_TRANSITIONS: Record<MpSyncJobStatus, MpSyncJobStatus[]> = {
   queued: ['running', 'cancelled'],
   running: ['completed', 'partial', 'failed', 'cancelled'],
-  partial: ['running'], // failed_only 重试可重新拉起
+  partial: ['running', 'cancelled'], // failed_only 重试可重新拉起；也允许用户放弃重试直接取消（F-C2-2）
   failed: ['running'],
   completed: [],
   cancelled: [],
@@ -104,12 +104,16 @@ const ACCOUNT_TRANSITIONS: Record<MpSyncJobAccountStatus, MpSyncJobAccountStatus
   cancelled: [],
 };
 
+// 不再用全局 from===to 放宽“同态自迁移”：那会让 succeeded->succeeded / failed->failed
+// 等终态重放静默通过 assert，进而改写已完成事实、重复累加 retry_count（F-C2-1）。
+// 幂等一律在各 mutator 入口显式处理（startJob / markAccountRunning 的 running 早返回、
+// applyAccountOutcome 的终态只读幂等门、finalizeJob 的 next===status 早返回）。
 export function canTransitionJob(from: MpSyncJobStatus, to: MpSyncJobStatus): boolean {
-  return from === to || JOB_TRANSITIONS[from].includes(to);
+  return JOB_TRANSITIONS[from].includes(to);
 }
 
 export function canTransitionAccount(from: MpSyncJobAccountStatus, to: MpSyncJobAccountStatus): boolean {
-  return from === to || ACCOUNT_TRANSITIONS[from].includes(to);
+  return ACCOUNT_TRANSITIONS[from].includes(to);
 }
 
 function assertJobTransition(from: MpSyncJobStatus, to: MpSyncJobStatus) {
@@ -340,6 +344,31 @@ export function applyAccountOutcome(jobId: string, fakeid: string, outcome: Acco
   const db = getMpSyncDatabase();
   const account = getJobAccount(jobId, fakeid);
   if (!account) throw new Error(`mp_sync_job_account not found: ${jobId}/${fakeid}`);
+
+  // 只有 running 账号能落定一次 outcome（outcome = 一次 running 尝试的结果）。
+  // 已终态账号再次进入这里 = 重复回调 / 恢复重放 / API 重试（F-C2-1）：
+  //   - 目标终态与现状“落库后完全等值”（用与下方 UPDATE 相同的 ?? 解析口径逐字段比对）→ 只读幂等返回，
+  //     绝不改写终态字段、绝不再累加 retry_count、绝不刷新 finished_at；
+  //   - 任何字段不同 → 视为对已完成事实的非法改写，拒绝。
+  if (account.status !== 'running') {
+    const resolvedNewArticles = outcome.newArticles ?? account.newArticles;
+    const resolvedPageCursor = outcome.pageCursor ?? account.pageCursor;
+    const resolvedLastArticleTime = outcome.lastArticleTime ?? account.lastArticleTime;
+    const resolvedErrorCode = outcome.status === 'succeeded' ? null : (outcome.errorCode ?? null);
+    const resolvedErrorMessage = outcome.status === 'succeeded' ? null : (outcome.errorMessage ?? null);
+    const identicalReplay =
+      account.status === outcome.status &&
+      resolvedNewArticles === account.newArticles &&
+      resolvedPageCursor === account.pageCursor &&
+      resolvedLastArticleTime === account.lastArticleTime &&
+      resolvedErrorCode === account.errorCode &&
+      resolvedErrorMessage === account.errorMessage;
+    if (identicalReplay) return account;
+    throw new Error(
+      `cannot apply outcome '${outcome.status}' to non-running account '${account.status}': ${jobId}/${fakeid}`
+    );
+  }
+  // 到这里 account.status === 'running'；running -> succeeded|failed|auth_required 均合法（防御性再断言）。
   assertAccountTransition(account.status, outcome.status);
 
   const now = nowIso();
@@ -386,8 +415,11 @@ export function requestCancel(id: string): MpSyncJob {
   const db = getMpSyncDatabase();
   const job = selectJob(db, id);
   if (!job) throw new Error(`mp_sync_job not found: ${id}`);
-  if (job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled') {
-    throw new Error(`cannot cancel job in terminal status: ${job.status}`);
+  // 单一事实源：能否请求取消 == 该状态能否合法迁移到 cancelled（JOB_TRANSITIONS 为唯一真相）。
+  // 由此 requestCancel 的受理集与 finalizeJob 的落定集永不 split-brain：
+  // queued/running/partial 可取消；completed/failed/cancelled 不可（抛错）。
+  if (!canTransitionJob(job.status, 'cancelled')) {
+    throw new Error(`cannot cancel job in status: ${job.status}`);
   }
   db.prepare('UPDATE mp_sync_jobs SET cancel_requested_at = COALESCE(cancel_requested_at, ?) WHERE id = ?').run(
     nowIso(),
@@ -420,6 +452,14 @@ export function finalizeJob(id: string): MpSyncJob {
       next = 'failed';
     } else {
       next = 'partial';
+    }
+    if (next === job.status) {
+      // 幂等：重复 finalize 且结论未变 -> 只读返回，不做 X->X 迁移、不刷新 finished_at。
+      // 聚合已按 job_accounts 真值幂等重算，提交无副作用。
+      // 注意：partial 任务在 requestCancel 后再 finalize 时 next='cancelled'!==job.status，
+      // 不会命中此早返回，仍走下方合法迁移收口（F-C2-2）。
+      db.exec('COMMIT;');
+      return selectJob(db, id) as MpSyncJob;
     }
     assertJobTransition(job.status, next);
     db.prepare('UPDATE mp_sync_jobs SET status = ?, finished_at = COALESCE(finished_at, ?) WHERE id = ?').run(

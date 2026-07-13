@@ -221,6 +221,88 @@ try {
   // 经 NULL 后 COALESCE(NULL, now) 必写新鲜值，故只断言非 null（不比较字符串，避免同毫秒 flaky）。
   check('13. re-finalize 写入新鲜 finished_at（经 NULL 后重置）', reFinal.finishedAt !== null);
 
+  // ── 14. F-C2-1: 终态 succeeded 账号 outcome 重放不得改写已完成事实 ──────────
+  //  旧实现 canTransitionAccount 的全局 from===to 让 succeeded->succeeded 静默通过，
+  //  UPDATE 会把记录改写为新 payload 并刷新 finished_at。返修后：不同 payload 拒绝、同 payload 只读幂等。
+  const jrep = jobs.createSyncJob({ id: 'job-replay', accounts: [{ fakeid: 'r' }] });
+  jobs.startJob('job-replay');
+  jobs.markAccountRunning('job-replay', 'r');
+  jobs.applyAccountOutcome('job-replay', 'r', {
+    status: 'succeeded',
+    newArticles: 1,
+    pageCursor: 20,
+    lastArticleTime: 100,
+  });
+  const rBefore = jobs.getJobAccount('job-replay', 'r');
+  throws('14a. 终态 succeeded 不同 payload 重放被拒（fix-must-fail：旧实现会改写为 99/999/999）', () =>
+    jobs.applyAccountOutcome('job-replay', 'r', {
+      status: 'succeeded',
+      newArticles: 99,
+      pageCursor: 999,
+      lastArticleTime: 999,
+    })
+  );
+  const rAfter = jobs.getJobAccount('job-replay', 'r');
+  check(
+    '14a. 被拒后记录未被改写（仍 1/20/100）',
+    rAfter.newArticles === 1 && rAfter.pageCursor === 20 && rAfter.lastArticleTime === 100
+  );
+  check('14a. 被拒后 finished_at 未刷新', rAfter.finishedAt === rBefore.finishedAt);
+  const rIdem = jobs.applyAccountOutcome('job-replay', 'r', {
+    status: 'succeeded',
+    newArticles: 1,
+    pageCursor: 20,
+    lastArticleTime: 100,
+  });
+  check(
+    '14b. 完全相同 payload 重放 -> 只读幂等（值不变、retry 不动）',
+    rIdem.newArticles === 1 && rIdem.pageCursor === 20 && rIdem.lastArticleTime === 100 && rIdem.retryCount === 0
+  );
+  throws('14c. 终态 succeeded 想翻成 failed 被拒', () =>
+    jobs.applyAccountOutcome('job-replay', 'r', { status: 'failed', errorCode: 'x' })
+  );
+
+  // ── 15. F-C2-1: failed 终态同 payload 重放不再累加 retry_count ─────────────
+  //  旧实现每次重放都 retry_count += 1，导致退避次数漂移。返修后同 payload 只读幂等、不同 payload 拒绝。
+  const jret = jobs.createSyncJob({ id: 'job-retrydrift', accounts: [{ fakeid: 's' }] });
+  jobs.startJob('job-retrydrift');
+  jobs.markAccountRunning('job-retrydrift', 's');
+  jobs.applyAccountOutcome('job-retrydrift', 's', {
+    status: 'failed',
+    errorCode: 'timeout',
+    errorMessage: 'boom',
+  });
+  check('15. 首次 failed -> retry_count=1', jobs.getJobAccount('job-retrydrift', 's').retryCount === 1);
+  const sIdem = jobs.applyAccountOutcome('job-retrydrift', 's', {
+    status: 'failed',
+    errorCode: 'timeout',
+    errorMessage: 'boom',
+  });
+  check('15. 同 payload failed 重放 retry_count 不漂移（fix-must-fail：旧实现变 2）', sIdem.retryCount === 1);
+  throws('15. 不同 payload failed 重放被拒', () =>
+    jobs.applyAccountOutcome('job-retrydrift', 's', { status: 'failed', errorCode: 'other' })
+  );
+  check('15. 被拒后 retry_count 仍为 1', jobs.getJobAccount('job-retrydrift', 's').retryCount === 1);
+
+  // ── 16. F-C2-2: partial 任务请求取消后可落定为 cancelled ────────────────────
+  //  旧实现 partial 只能迁到 running，requestCancel 却接受 partial 并写标记，
+  //  随后 finalize 的 partial->cancelled 必抛错，形成“取消已落盘但无法收口”的死结。
+  const jpc = jobs.createSyncJob({ id: 'job-partial-cancel', accounts: [{ fakeid: 'a' }, { fakeid: 'b' }] });
+  jobs.startJob('job-partial-cancel');
+  jobs.markAccountRunning('job-partial-cancel', 'a');
+  jobs.applyAccountOutcome('job-partial-cancel', 'a', { status: 'succeeded', newArticles: 1 });
+  // b 保持 pending：1 成功 + 1 未处理
+  const pcFirst = jobs.finalizeJob('job-partial-cancel');
+  check('16. 1 成功 + 1 pending -> partial', pcFirst.status === 'partial');
+  const pcCancel = jobs.requestCancel('job-partial-cancel');
+  check('16. partial 可请求取消并写标记', pcCancel.cancelRequestedAt !== null);
+  const pcFinal = jobs.finalizeJob('job-partial-cancel');
+  check('16. partial + 取消标记 -> cancelled（fix-must-fail：旧实现此处抛错卡死）', pcFinal.status === 'cancelled');
+  check(
+    '16. 收口后取消标记与终态一致',
+    pcFinal.status === 'cancelled' && pcFinal.cancelRequestedAt !== null
+  );
+
   console.log(`\nPASS smoke_mp_sync_jobs: ${passed} assertions`);
 } catch (err) {
   console.error('FAIL smoke_mp_sync_jobs:', err && err.stack ? err.stack : err);
