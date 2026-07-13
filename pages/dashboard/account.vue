@@ -12,7 +12,9 @@ import type {
 import { AgGridVue } from 'ag-grid-vue3';
 import { defu } from 'defu';
 import { formatTimeStamp, sleep } from '#shared/utils/helpers';
+import { stripImportedFromQuery } from '#shared/utils/mp-account-import';
 import { getArticleList } from '~/apis';
+import ServerImportDialog from '~/components/dashboard/ServerImportDialog.vue';
 import GlobalSearchAccountDialog from '~/components/global/SearchAccountDialog.vue';
 import GridAccountActions from '~/components/grid/AccountActions.vue';
 import GridLoadProgress from '~/components/grid/LoadProgress.vue';
@@ -473,6 +475,12 @@ async function handleFileChange(evt: Event) {
   }
 }
 
+// 导入到服务端账号注册表（dry-run 预检；本轮只预检、不做正式写入）
+async function openServerImport() {
+  const accounts = await getAllInfo();
+  modal.open(ServerImportDialog, { accounts });
+}
+
 // 导出公众号
 const exportBtnLoading = ref(false);
 function exportAccount() {
@@ -499,7 +507,8 @@ onMounted(async () => {
 
   const importedCount = Array.isArray(imported) ? imported[0] : imported;
   toast.success('导入完成', `已导入 ${importedCount} 个账号`);
-  await navigateTo('/dashboard/account', { replace: true });
+  // 根因修复：只移除 imported 参数、保留其它 query，避免用裸路径导航把未确认状态一并清掉。
+  await navigateTo({ path: route.path, query: stripImportedFromQuery(route.query) }, { replace: true });
 });
 </script>
 
@@ -518,6 +527,9 @@ onMounted(async () => {
         <UButton icon="i-lucide:arrow-down-to-line" color="blue" :loading="importBtnLoading" @click="importAccount">
           批量导入
           <input ref="fileRef" type="file" accept=".json" class="hidden" @change="handleFileChange" />
+        </UButton>
+        <UButton icon="i-lucide:cloud-upload" color="blue" :disabled="isDeleting" @click="openServerImport">
+          导入到服务端(预检)
         </UButton>
         <UButton
           icon="i-lucide:arrow-up-from-line"
