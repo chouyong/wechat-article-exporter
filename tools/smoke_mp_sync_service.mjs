@@ -137,6 +137,37 @@ try {
   const r12 = await syncSingleAccount({ fakeid: 'acc', sinceTime: since12, pageSize: 2, knownAids: ['k2'] }, f12);
   check('12. 重叠区已知 k2 去重 -> 仅新 k1', r12.newArticles.length === 1 && r12.newArticles[0].aid === 'k1');
 
+  // ── 13. N-C2-1：非法分页参数 fail-fast（正整数硬校验 + 零网络调用）──────
+  //   fix-must-fail：若移除服务里的 assertPositiveIntParam，pageSize=0（空翻）/ maxPages=0（零请求）
+  //   会返回 succeeded 而非 reject，下列 assert.rejects 将变红。
+  let n13calls = 0;
+  const fCount = async () => {
+    n13calls += 1;
+    return { articles: [], hasMore: false };
+  };
+  for (const bad of [0, -1, 2.5, NaN, Infinity]) {
+    await assert.rejects(
+      syncSingleAccount({ fakeid: 'acc', sinceTime: 1000, pageSize: bad }, fCount),
+      /pageSize 必须为正整数/,
+      `13. pageSize=${bad} 应 fail-fast`
+    );
+    passed += 1;
+  }
+  for (const bad of [0, -1, 1.5, NaN, Infinity]) {
+    await assert.rejects(
+      syncSingleAccount({ fakeid: 'acc', sinceTime: 1000, maxPages: bad }, fCount),
+      /maxPages 必须为正整数/,
+      `13. maxPages=${bad} 应 fail-fast`
+    );
+    passed += 1;
+  }
+  check('13. 非法分页参数零网络调用（fetchPage 未触发）', n13calls === 0);
+  const r13 = await syncSingleAccount(
+    { fakeid: 'acc', sinceTime: 1000, pageSize: 2, maxPages: 5 },
+    pagedFetcher([{ articles: [article('z1', 2000)], hasMore: false }])
+  );
+  check('13. 合法正整数分页参数仍 succeeded', r13.status === 'succeeded' && r13.newArticles.length === 1);
+
   console.log(`\nPASS smoke_mp_sync_service: ${passed} assertions`);
 } catch (err) {
   console.error('FAIL smoke_mp_sync_service:', err && err.stack ? err.stack : err);

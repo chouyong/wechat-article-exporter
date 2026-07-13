@@ -132,6 +132,19 @@ const DEFAULT_PAGE_SIZE = 20;
 const DEFAULT_MAX_PAGES = 500;
 
 /**
+ * N-C2-1：分页参数正整数硬校验。pageSize / maxPages 必须为正整数，否则 fail-fast 抛 RangeError。
+ * 仅靠 `值 ?? 默认` 挡不住 0 / 负数 / 非整数 / NaN / Infinity（`0 ?? 20 === 0`）：
+ *   - pageSize=0 → `begin += 0` 对同一 begin 空翻到 maxPages 次，仍返回 succeeded、pageCursor=0；
+ *   - maxPages=0 → `while (0 < 0)` 零请求直接 succeeded、pagesFetched=0。
+ * 这会把配置错误伪装成成功。校验放在任何 fetchPage 之前，保证非法配置零网络调用。
+ */
+function assertPositiveIntParam(value: number, name: string): void {
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new RangeError(`syncSingleAccount: ${name} 必须为正整数，实际收到 ${value}`);
+  }
+}
+
+/**
  * 拉取单账号 create_time >= sinceTime 的新文章（增量）。
  * 停止条件：本页出现旧文章 / 末页（返回数 < size 或 hasMore=false）/ 空页 / 达 maxPages 上限。
  * 失败不抛出：返回 status='failed'|'auth_required' 且带 errorKind，已收集的文章一并返回（失败隔离）。
@@ -142,6 +155,9 @@ export async function syncSingleAccount(
 ): Promise<AccountSyncOutcome> {
   const pageSize = options.pageSize ?? DEFAULT_PAGE_SIZE;
   const maxPages = options.maxPages ?? DEFAULT_MAX_PAGES;
+  // N-C2-1：非法分页参数 fail-fast（在任何 fetchPage 之前抛错，零网络调用），避免 0/负/非整值伪装成 succeeded。
+  assertPositiveIntParam(pageSize, 'pageSize');
+  assertPositiveIntParam(maxPages, 'maxPages');
   const seenAids = new Set<string>(options.knownAids ?? []);
   const seenLinks = new Set<string>(options.knownLinks ?? []);
   const collected: SyncArticle[] = [];
