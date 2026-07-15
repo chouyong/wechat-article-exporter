@@ -137,26 +137,30 @@ try {
   const r12 = await syncSingleAccount({ fakeid: 'acc', sinceTime: since12, pageSize: 2, knownAids: ['k2'] }, f12);
   check('12. 重叠区已知 k2 去重 -> 仅新 k1', r12.newArticles.length === 1 && r12.newArticles[0].aid === 'k1');
 
-  // ── 13. N-C2-1：非法分页参数 fail-fast（正整数硬校验 + 零网络调用）──────
+  // ── 13. N-C2-1：非法分页参数 fail-fast（安全正整数硬校验 + 零网络调用）──
   //   fix-must-fail：若移除服务里的 assertPositiveIntParam，pageSize=0（空翻）/ maxPages=0（零请求）
   //   会返回 succeeded 而非 reject，下列 assert.rejects 将变红。
+  //   F-N-C2-1 加固：MAX_SAFE_INTEGER+1 / MAX_VALUE 等「有限但不安全」整数被 Number.isInteger 判 true，
+  //   却会让 begin 算术溢出到 Infinity 仍伪装 succeeded；改用 Number.isSafeInteger 后被拒。若把服务里的
+  //   isSafeInteger 退回 isInteger，下面 UNSAFE 两个用例将精确变红（Missing expected rejection）。
   let n13calls = 0;
   const fCount = async () => {
     n13calls += 1;
     return { articles: [], hasMore: false };
   };
-  for (const bad of [0, -1, 2.5, NaN, Infinity]) {
+  const UNSAFE = [Number.MAX_SAFE_INTEGER + 1, Number.MAX_VALUE];
+  for (const bad of [0, -1, 2.5, NaN, Infinity, ...UNSAFE]) {
     await assert.rejects(
       syncSingleAccount({ fakeid: 'acc', sinceTime: 1000, pageSize: bad }, fCount),
-      /pageSize 必须为正整数/,
+      /pageSize 必须为安全正整数/,
       `13. pageSize=${bad} 应 fail-fast`
     );
     passed += 1;
   }
-  for (const bad of [0, -1, 1.5, NaN, Infinity]) {
+  for (const bad of [0, -1, 1.5, NaN, Infinity, ...UNSAFE]) {
     await assert.rejects(
       syncSingleAccount({ fakeid: 'acc', sinceTime: 1000, maxPages: bad }, fCount),
-      /maxPages 必须为正整数/,
+      /maxPages 必须为安全正整数/,
       `13. maxPages=${bad} 应 fail-fast`
     );
     passed += 1;
@@ -167,6 +171,15 @@ try {
     pagedFetcher([{ articles: [article('z1', 2000)], hasMore: false }])
   );
   check('13. 合法正整数分页参数仍 succeeded', r13.status === 'succeeded' && r13.newArticles.length === 1);
+  // 边界精确性：安全整数上界 MAX_SAFE_INTEGER 本身仍应被接受（空页即停，游标不溢出为非有限）。
+  const rSafe = await syncSingleAccount(
+    { fakeid: 'acc', sinceTime: 1000, pageSize: Number.MAX_SAFE_INTEGER, maxPages: Number.MAX_SAFE_INTEGER },
+    async () => ({ articles: [], hasMore: false })
+  );
+  check(
+    '13. 边界 MAX_SAFE_INTEGER 被接受且游标有限',
+    rSafe.status === 'succeeded' && Number.isFinite(rSafe.pageCursor)
+  );
 
   console.log(`\nPASS smoke_mp_sync_service: ${passed} assertions`);
 } catch (err) {

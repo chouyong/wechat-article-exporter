@@ -132,15 +132,20 @@ const DEFAULT_PAGE_SIZE = 20;
 const DEFAULT_MAX_PAGES = 500;
 
 /**
- * N-C2-1：分页参数正整数硬校验。pageSize / maxPages 必须为正整数，否则 fail-fast 抛 RangeError。
+ * N-C2-1：分页参数正整数硬校验。pageSize / maxPages 必须为「安全正整数」（Number.isSafeInteger 且 > 0），
+ * 否则 fail-fast 抛 RangeError。
  * 仅靠 `值 ?? 默认` 挡不住 0 / 负数 / 非整数 / NaN / Infinity（`0 ?? 20 === 0`）：
  *   - pageSize=0 → `begin += 0` 对同一 begin 空翻到 maxPages 次，仍返回 succeeded、pageCursor=0；
  *   - maxPages=0 → `while (0 < 0)` 零请求直接 succeeded、pagesFetched=0。
- * 这会把配置错误伪装成成功。校验放在任何 fetchPage 之前，保证非法配置零网络调用。
+ * 用 isSafeInteger 而非 isInteger（F-N-C2-1）：Number.MAX_SAFE_INTEGER+1 / 1e100 / Number.MAX_VALUE 都会被
+ * isInteger 判 true，但它们不能安全用于游标算术——例如 begin += Number.MAX_VALUE 会溢出到 Infinity，
+ * 使 pageCursor=Infinity 仍伪装 succeeded，并把非有限 begin 传给 C3 注入的真实 fetcher；对 maxPages
+ * 而言不安全的大整数也让「最多翻页数」失去实际上限。这些都属「非法配置伪装成功」。
+ * 校验放在任何 fetchPage 之前，保证非法配置零网络调用。
  */
 function assertPositiveIntParam(value: number, name: string): void {
-  if (!Number.isInteger(value) || value <= 0) {
-    throw new RangeError(`syncSingleAccount: ${name} 必须为正整数，实际收到 ${value}`);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new RangeError(`syncSingleAccount: ${name} 必须为安全正整数，实际收到 ${value}`);
   }
 }
 
