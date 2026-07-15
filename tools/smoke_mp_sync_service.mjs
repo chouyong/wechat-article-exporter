@@ -171,14 +171,71 @@ try {
     pagedFetcher([{ articles: [article('z1', 2000)], hasMore: false }])
   );
   check('13. 合法正整数分页参数仍 succeeded', r13.status === 'succeeded' && r13.newArticles.length === 1);
-  // 边界精确性：安全整数上界 MAX_SAFE_INTEGER 本身仍应被接受（空页即停，游标不溢出为非有限）。
-  const rSafe = await syncSingleAccount(
-    { fakeid: 'acc', sinceTime: 1000, pageSize: Number.MAX_SAFE_INTEGER, maxPages: Number.MAX_SAFE_INTEGER },
+  // 参数校验层：pageSize=MAX_SAFE_INTEGER 作为「参数」被校验接受（不抛 RangeError）。
+  //   注意：此处空页立即停止，仅证「参数被接受」，不证游标累加安全——累加安全见 13c，勿据此声称「边界精确」。
+  const rParamMax = await syncSingleAccount(
+    { fakeid: 'acc', sinceTime: 1000, pageSize: Number.MAX_SAFE_INTEGER, maxPages: 3 },
     async () => ({ articles: [], hasMore: false })
   );
+  check('13. 参数 MAX_SAFE_INTEGER 通过校验被接受（空页即停，仅证参数接受）', rParamMax.status === 'succeeded');
+
+  // ── 13c. F-N-C2-1（累加闭包）：pageSize 安全但多次 begin+=pageSize 使游标越界 → fail-closed ──
+  //   fix-must-fail：移除服务里循环内 `begin > MAX_SAFE_INTEGER - pageSize` 的游标 guard 后，
+  //   第 3 次 fetch 的 begin = 2*MAX_SAFE_INTEGER（非安全整数）且最终仍 succeeded，
+  //   下面「fetcher 从未收到非安全整数 begin」将精确变红。
+  const beginsSeen = [];
+  const fOverflow = async ({ begin: b }) => {
+    beginsSeen.push(b);
+    return { articles: [article(`ov${b}`, 5000)], hasMore: true };
+  };
+  const rOv = await syncSingleAccount(
+    { fakeid: 'acc', sinceTime: 1000, pageSize: Number.MAX_SAFE_INTEGER, maxPages: 3 },
+    fOverflow
+  );
+  check('13c. 游标累加：fetcher 从未收到非安全整数 begin', beginsSeen.every(b => Number.isSafeInteger(b)));
+  check('13c. 游标累加：只发生 2 次 fetch（第 3 次不安全，未发起）', beginsSeen.length === 2);
   check(
-    '13. 边界 MAX_SAFE_INTEGER 被接受且游标有限',
-    rSafe.status === 'succeeded' && Number.isFinite(rSafe.pageCursor)
+    '13c. 游标累加：begin 序列 = [0, MAX_SAFE_INTEGER]',
+    beginsSeen[0] === 0 && beginsSeen[1] === Number.MAX_SAFE_INTEGER
+  );
+  check('13c. 游标累加：fail-closed 绝不返回 succeeded', rOv.status !== 'succeeded');
+  check('13c. 游标累加：status=failed', rOv.status === 'failed');
+  check('13c. 游标累加：pageCursor 仍是安全整数', Number.isSafeInteger(rOv.pageCursor));
+  check(
+    '13c. 游标累加：保留最后一个安全 pageCursor=MAX_SAFE_INTEGER',
+    rOv.pageCursor === Number.MAX_SAFE_INTEGER
+  );
+
+  // ── 13d. F-N-C2-1：startBegin 非负安全整数 fail-fast（零网络）+ 合法边界 ──
+  //   原实现 Math.max(0, startBegin ?? 0) 会静默放行 Infinity / 非安全整数、并把负数 clamp 成 0。
+  let sbCalls = 0;
+  const fSb = async () => {
+    sbCalls += 1;
+    return { articles: [], hasMore: false };
+  };
+  for (const bad of [Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1, Number.MAX_VALUE, -1, 2.5, NaN]) {
+    await assert.rejects(
+      syncSingleAccount({ fakeid: 'acc', sinceTime: 1000, startBegin: bad }, fSb),
+      /startBegin 必须为非负安全整数/,
+      `13d. startBegin=${bad} 应 fail-fast`
+    );
+    passed += 1;
+  }
+  check('13d. startBegin 非法零网络调用（fetchPage 未触发）', sbCalls === 0);
+  const rSb0 = await syncSingleAccount(
+    { fakeid: 'acc', sinceTime: 1000, startBegin: 0, pageSize: 2 },
+    pagedFetcher([{ articles: [article('sb0', 2000)], hasMore: false }])
+  );
+  check('13d. startBegin=0 合法 succeeded', rSb0.status === 'succeeded' && rSb0.newArticles.length === 1);
+  const rSbMax = await syncSingleAccount(
+    { fakeid: 'acc', sinceTime: 1000, startBegin: Number.MAX_SAFE_INTEGER, pageSize: 2 },
+    async () => ({ articles: [article('sbm', 2000)], hasMore: false })
+  );
+  check(
+    '13d. startBegin=MAX_SAFE_INTEGER 合法边界 succeeded 且 pageCursor 安全',
+    rSbMax.status === 'succeeded' &&
+      Number.isSafeInteger(rSbMax.pageCursor) &&
+      rSbMax.pageCursor === Number.MAX_SAFE_INTEGER
   );
 
   console.log(`\nPASS smoke_mp_sync_service: ${passed} assertions`);

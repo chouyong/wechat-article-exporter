@@ -150,9 +150,23 @@ function assertPositiveIntParam(value: number, name: string): void {
 }
 
 /**
+ * F-N-C2-1：startBegin 断点续跑游标必须为「非负安全整数」（Number.isSafeInteger 且 >= 0），否则 fail-fast。
+ * 原实现 `Math.max(0, options.startBegin ?? 0)` 会静默放行 Infinity / Number.MAX_SAFE_INTEGER+1 / 非整数，
+ * 把非安全游标直接交给首次 fetchPage；负数被静默 clamp 成 0 也掩盖了配置错误。改为在任何 fetchPage 之前
+ * 显式校验、非法即抛（零网络调用）。允许 0（有效起点）与 MAX_SAFE_INTEGER（累加安全性由循环内游标 guard 兜底）。
+ */
+function assertStartBeginParam(value: number): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError(`syncSingleAccount: startBegin 必须为非负安全整数，实际收到 ${value}`);
+  }
+}
+
+/**
  * 拉取单账号 create_time >= sinceTime 的新文章（增量）。
- * 停止条件：本页出现旧文章 / 末页（返回数 < size 或 hasMore=false）/ 空页 / 达 maxPages 上限。
+ * 停止条件：本页出现旧文章 / 末页（返回数 < size 或 hasMore=false）/ 空页 / 达 maxPages 上限 /
+ *           下一游标 begin+pageSize 越过安全整数上界（F-N-C2-1，fail-closed 返回 failed）。
  * 失败不抛出：返回 status='failed'|'auth_required' 且带 errorKind，已收集的文章一并返回（失败隔离）。
+ * 参数契约（pageSize/maxPages/startBegin）非法则在任何 fetchPage 之前 fail-fast 抛 RangeError（零网络）。
  */
 export async function syncSingleAccount(
   options: SyncAccountOptions,
@@ -160,14 +174,17 @@ export async function syncSingleAccount(
 ): Promise<AccountSyncOutcome> {
   const pageSize = options.pageSize ?? DEFAULT_PAGE_SIZE;
   const maxPages = options.maxPages ?? DEFAULT_MAX_PAGES;
-  // N-C2-1：非法分页参数 fail-fast（在任何 fetchPage 之前抛错，零网络调用），避免 0/负/非整值伪装成 succeeded。
+  const startBegin = options.startBegin ?? 0;
+  // N-C2-1：非法分页参数 fail-fast（在任何 fetchPage 之前抛错，零网络调用），避免 0/负/非整/不安全大整数伪装成 succeeded。
   assertPositiveIntParam(pageSize, 'pageSize');
   assertPositiveIntParam(maxPages, 'maxPages');
+  // F-N-C2-1：startBegin 校验为非负安全整数（不再 Math.max 静默 clamp），避免把 Infinity/非安全游标交给首次 fetch。
+  assertStartBeginParam(startBegin);
   const seenAids = new Set<string>(options.knownAids ?? []);
   const seenLinks = new Set<string>(options.knownLinks ?? []);
   const collected: SyncArticle[] = [];
   let lastArticleTime: number | null = null;
-  let begin = Math.max(0, options.startBegin ?? 0);
+  let begin = startBegin;
   let pagesFetched = 0;
 
   try {
@@ -193,6 +210,20 @@ export async function syncSingleAccount(
       }
 
       if (hitOld || !page.hasMore || page.articles.length === 0) break;
+      // F-N-C2-1（累加闭包）：pageSize 自身是安全整数不代表 begin += pageSize 多次累加后仍安全。
+      // 下一游标越过安全整数上界即 fail-closed：不推进游标、不发起下一次 fetchPage、保留最后一个安全
+      // pageCursor、绝不返回 succeeded。等价 Codex 建议判据 `begin <= MAX_SAFE_INTEGER - pageSize`。
+      if (begin > Number.MAX_SAFE_INTEGER - pageSize) {
+        return {
+          status: 'failed',
+          newArticles: collected,
+          pagesFetched,
+          pageCursor: begin,
+          lastArticleTime,
+          errorKind: 'api_error',
+          errorMessage: `syncSingleAccount: 分页游标将溢出安全整数范围（begin=${begin} + pageSize=${pageSize} > ${Number.MAX_SAFE_INTEGER}），已 fail-closed 停止翻页`,
+        };
+      }
       begin += pageSize;
     }
     return {
