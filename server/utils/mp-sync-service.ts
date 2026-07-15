@@ -31,7 +31,24 @@ export interface FetchPageResult {
 
 export type PageFetcher = (params: { fakeid: string; begin: number; size: number }) => Promise<FetchPageResult>;
 
-export type SyncErrorKind = 'rate_limited' | 'timeout' | 'auth_required' | 'network' | 'api_error';
+/**
+ * C3-0（C3-0-F1）：错误 kind → 是否可重试 的**单一事实源**（as const 策略表）。
+ * SyncErrorKind 由本表 key 派生（keyof typeof），可重试性由本表值决定——两者不会再各写一份而漂移。
+ * 增删 kind 只改本表一处：① 类型层随 key 集变化；② smoke（section 14c）断言 Object.keys(RETRY_POLICY)
+ * 完整 key 集，增删必变红。杜绝原 switch+default 「新增未登记 kind 被 default 静默接受」（守卫仅注释、运行时不成立）。
+ * rate_limited/timeout/network=瞬时可重试；auth_required=暂停+通知（不重试）；
+ * api_error=默认保守不可重试（待细分确认瞬时子类）；config_error=确定性配置错误不可重试。
+ */
+export const RETRY_POLICY = {
+  rate_limited: true,
+  timeout: true,
+  network: true,
+  auth_required: false,
+  api_error: false,
+  config_error: false,
+} as const;
+
+export type SyncErrorKind = keyof typeof RETRY_POLICY;
 
 /** fetcher 可抛出的分类错误；C3 的真实抓取器把微信响应语义翻译成明确 kind。 */
 export class SyncFetchError extends Error {
@@ -42,6 +59,22 @@ export class SyncFetchError extends Error {
     this.name = 'SyncFetchError';
     this.kind = kind;
     this.code = code;
+  }
+}
+
+/**
+ * C3-0：确定性配置错误（前置参数越界 / 非安全整数 / startBegin 非法 / 业务上限越界等本地边界违规）。
+ * extends RangeError（硬性要求）：N-C2-1/F-N-C2-1 现有参数校验抛的就是 RangeError，继承后
+ * `instanceof RangeError` 仍成立，既有「抛 RangeError」契约不被破坏；绝不降级为普通 Error。
+ * 携带 kind='config_error'、retryable=false，供 runner 侧穷举策略 isRetryableErrorKind 判为不可重试。
+ * 通道 A：前置校验在任何 fetchPage 之前抛出本错误（零网络 fail-fast）。
+ */
+export class SyncConfigError extends RangeError {
+  readonly kind = 'config_error' as const;
+  readonly retryable = false as const;
+  constructor(message: string) {
+    super(message);
+    this.name = 'SyncConfigError';
   }
 }
 
@@ -108,6 +141,15 @@ export function classifyFetchError(err: unknown): SyncErrorKind {
   return 'api_error';
 }
 
+/**
+ * C3-0：错误可重试性映射（runner 侧消费，不作为 AccountSyncOutcome 持久字段）。
+ * 已知 kind 查 RETRY_POLICY 单一事实源；运行时未知输入（类型契约之外）fail-closed 返回 false（不可重试）。
+ * 可重试性策略的增删只改 RETRY_POLICY 一处，SyncErrorKind 随之派生、smoke key 集断言随之变红。
+ */
+export function isRetryableErrorKind(kind: SyncErrorKind): boolean {
+  return RETRY_POLICY[kind] ?? false;
+}
+
 /** 从 last_article_time 前留一个重叠窗口，避免边界漏文；去重保证重叠部分不产生重复。 */
 export function computeSinceWithOverlap(lastArticleTime: number, overlapSeconds = 3600): number {
   return Math.max(0, Math.floor(lastArticleTime) - Math.max(0, Math.floor(overlapSeconds)));
@@ -142,10 +184,11 @@ const DEFAULT_MAX_PAGES = 500;
  * 使 pageCursor=Infinity 仍伪装 succeeded，并把非有限 begin 传给 C3 注入的真实 fetcher；对 maxPages
  * 而言不安全的大整数也让「最多翻页数」失去实际上限。这些都属「非法配置伪装成功」。
  * 校验放在任何 fetchPage 之前，保证非法配置零网络调用。
+ * C3-0：抛类型化 SyncConfigError（extends RangeError，既有「抛 RangeError」契约不破坏）而非裸 RangeError（通道 A）。
  */
 function assertPositiveIntParam(value: number, name: string): void {
   if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new RangeError(`syncSingleAccount: ${name} 必须为安全正整数，实际收到 ${value}`);
+    throw new SyncConfigError(`syncSingleAccount: ${name} 必须为安全正整数，实际收到 ${value}`);
   }
 }
 
@@ -157,7 +200,7 @@ function assertPositiveIntParam(value: number, name: string): void {
  */
 function assertStartBeginParam(value: number): void {
   if (!Number.isSafeInteger(value) || value < 0) {
-    throw new RangeError(`syncSingleAccount: startBegin 必须为非负安全整数，实际收到 ${value}`);
+    throw new SyncConfigError(`syncSingleAccount: startBegin 必须为非负安全整数，实际收到 ${value}`);
   }
 }
 
@@ -213,6 +256,8 @@ export async function syncSingleAccount(
       // F-N-C2-1（累加闭包）：pageSize 自身是安全整数不代表 begin += pageSize 多次累加后仍安全。
       // 下一游标越过安全整数上界即 fail-closed：不推进游标、不发起下一次 fetchPage、保留最后一个安全
       // pageCursor、绝不返回 succeeded。等价 Codex 建议判据 `begin <= MAX_SAFE_INTEGER - pageSize`。
+      // C3-0（通道 B）：游标累加溢出是确定性配置错误 → errorKind='config_error'（不再是 api_error），
+      // 供 runner 经 isRetryableErrorKind 判为不可重试、直接失败终态（不退避、不无限重试）。
       if (begin > Number.MAX_SAFE_INTEGER - pageSize) {
         return {
           status: 'failed',
@@ -220,7 +265,7 @@ export async function syncSingleAccount(
           pagesFetched,
           pageCursor: begin,
           lastArticleTime,
-          errorKind: 'api_error',
+          errorKind: 'config_error',
           errorMessage: `syncSingleAccount: 分页游标将溢出安全整数范围（begin=${begin} + pageSize=${pageSize} > ${Number.MAX_SAFE_INTEGER}），已 fail-closed 停止翻页`,
         };
       }

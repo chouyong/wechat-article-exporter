@@ -9,7 +9,7 @@
 import assert from 'node:assert/strict';
 
 const svc = await import('../server/utils/mp-sync-service.ts');
-const { syncSingleAccount, classifyFetchError, computeSinceWithOverlap, deriveAidFromUrl, SyncFetchError } = svc;
+const { syncSingleAccount, classifyFetchError, computeSinceWithOverlap, deriveAidFromUrl, SyncFetchError, SyncConfigError, isRetryableErrorKind, RETRY_POLICY } = svc;
 
 let passed = 0;
 function check(desc, cond) {
@@ -237,6 +237,72 @@ try {
       Number.isSafeInteger(rSbMax.pageCursor) &&
       rSbMax.pageCursor === Number.MAX_SAFE_INTEGER
   );
+
+  // ── 14. C3-0：config_error 错误契约（通道A SyncConfigError + 通道B errorKind + isRetryableErrorKind 穷举）──
+  //   通道A：前置参数违规在任何 fetchPage 之前抛类型化 SyncConfigError（extends RangeError，既有「抛
+  //          RangeError」契约不破坏），kind='config_error'、retryable=false、零网络。
+  //   通道B：游标累加溢出返回 failed outcome + errorKind='config_error'（不再是 api_error）。
+  //   fix-must-fail：① 把服务 assert* 的 SyncConfigError 退回普通 RangeError → 14a instanceof SyncConfigError 变红；
+  //                  ② 把游标溢出 errorKind 退回 'api_error' → 14b 变红；
+  //                  ③ 把 isRetryableErrorKind 对 config_error/auth_required/api_error 改成 true → 14c 变红。
+
+  // 14a. 通道A：SyncConfigError 类型契约（双 instanceof + kind + retryable + 零网络）
+  let ccCalls = 0;
+  const fCC = async () => {
+    ccCalls += 1;
+    return { articles: [], hasMore: false };
+  };
+  const badParamCases = [
+    ['pageSize', 0],
+    ['maxPages', -1],
+    ['startBegin', Infinity],
+    ['pageSize', Number.MAX_SAFE_INTEGER + 1],
+    ['startBegin', -1],
+  ];
+  for (const [param, bad] of badParamCases) {
+    let thrown = null;
+    try {
+      await syncSingleAccount({ fakeid: 'acc', sinceTime: 1000, [param]: bad }, fCC);
+    } catch (e) {
+      thrown = e;
+    }
+    check(`14a. ${param}=${bad} 抛 SyncConfigError`, thrown instanceof SyncConfigError);
+    check(`14a. ${param}=${bad} 同时 instanceof RangeError（继承契约不破坏）`, thrown instanceof RangeError);
+    check(`14a. ${param}=${bad} kind='config_error'`, thrown?.kind === 'config_error');
+    check(`14a. ${param}=${bad} retryable===false`, thrown?.retryable === false);
+  }
+  check('14a. 通道A 前置违规零网络（fetchPage 未触发）', ccCalls === 0);
+
+  // 14b. 通道B：游标累加溢出返回 failed + errorKind='config_error'（保留已收 + pageCursor 安全 + 绝不 succeeded）
+  const beginsB = [];
+  const fOvB = async ({ begin: b }) => {
+    beginsB.push(b);
+    return { articles: [article(`b${b}`, 5000)], hasMore: true };
+  };
+  const rB = await syncSingleAccount(
+    { fakeid: 'acc', sinceTime: 1000, pageSize: Number.MAX_SAFE_INTEGER, maxPages: 3 },
+    fOvB
+  );
+  check('14b. 通道B 游标溢出 status=failed', rB.status === 'failed');
+  check("14b. 通道B errorKind='config_error'（不再是 api_error）", rB.errorKind === 'config_error');
+  check('14b. 通道B 绝不 succeeded', rB.status !== 'succeeded');
+  check('14b. 通道B fetcher 从未收到非安全 begin', beginsB.every(b => Number.isSafeInteger(b)));
+  check('14b. 通道B 保留已收文章（失败隔离）', rB.newArticles.length >= 1);
+  check('14b. 通道B outcome 经 isRetryableErrorKind 判不可重试', isRetryableErrorKind(rB.errorKind) === false);
+
+  // 14c. RETRY_POLICY 单一事实源：完整 key 集断言（增删 SyncErrorKind 必变红）+ 逐 kind 映射 + 未知 fail-closed
+  const EXPECTED_KINDS = ['api_error', 'auth_required', 'config_error', 'network', 'rate_limited', 'timeout'];
+  check(
+    '14c. RETRY_POLICY key 集完整（增删 SyncErrorKind 必须同步改此断言，否则变红）',
+    JSON.stringify(Object.keys(RETRY_POLICY).sort()) === JSON.stringify(EXPECTED_KINDS)
+  );
+  check('14c. config_error 不可重试', isRetryableErrorKind('config_error') === false);
+  check('14c. auth_required 不可重试（暂停+通知）', isRetryableErrorKind('auth_required') === false);
+  check('14c. api_error 默认不可重试（待细分瞬时子类）', isRetryableErrorKind('api_error') === false);
+  check('14c. rate_limited 可重试', isRetryableErrorKind('rate_limited') === true);
+  check('14c. timeout 可重试', isRetryableErrorKind('timeout') === true);
+  check('14c. network 可重试', isRetryableErrorKind('network') === true);
+  check('14c. 运行时未知 kind fail-closed（不可重试）', isRetryableErrorKind('nonexistent_kind') === false);
 
   console.log(`\nPASS smoke_mp_sync_service: ${passed} assertions`);
 } catch (err) {
