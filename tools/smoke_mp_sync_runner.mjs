@@ -1,11 +1,14 @@
-// 纯离线 smoke：C3-1 mp-sync-runner（核心编排循环 + classifyAccountResult 纯函数）。
+// 纯离线 smoke：mp-sync-runner（C3-1 核心编排 + C3-2 并发池 + C3-3 退避/时钟/timeout + 纯函数）。
 //
 // 直连 runner + 仓库层 + 真实 syncSingleAccount（不起 server、不发网络、不碰真实 .data）：
 //   - A 段：classifyAccountResult 单测，合成输入覆盖 succeeded / 各 errorKind / 未知 kind fail-closed /
 //           通道 A(SyncConfigError) / 未预期抛错。
-//   - B 段：runSyncJob 集成，临时 SQLite + 注入假 fetcher + resolveOptions 触发**真实** service 的
-//           通道 A(pageSize=0) 与 通道 B(游标溢出)；覆盖正常 succeeded 终态、空 job、失败隔离、
-//           零网络、优先级顺序、单次尝试不重试、finalize 三态。
+//   - B 段：runSyncJob 集成（临时 SQLite + 注入假 fetcher + resolveOptions 触发真实通道 A/B）。
+//   - C 段：ConcurrencyController 纯逻辑（升 / 降 / 保持 / 构造校验 / clamp）。
+//   - D 段：runSyncJobPool 集成（并发调度 + 自适应档位 + 系统故障传播）。
+//   - E 段（C3-3）：退避纯函数 + 配置校验 + 真实 createRealClock.sleep + 逻辑时钟结算协议单测。
+//   - F 段（C3-3）：退避重试 / per-page 软 timeout / 每 attempt 降档 / 逻辑 vs 真实 fetch 峰值 /
+//           非法配置零持久副作用 / timeout scheduler 故障 = 受控业务 outcome（R2-C3-3-1）集成。
 //
 // 运行（需 node:sqlite；Node 25 默认可用，Node 22.18+ 类型剥离默认开）：
 //   node --experimental-sqlite tools/smoke_mp_sync_runner.mjs
@@ -15,6 +18,14 @@ import { existsSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
+
+// F12（R2-C3-3-1）：捕获全局 unhandledRejection。timeout scheduler 同步 throw 时，withTimeout 的 wrapped
+// 结构保证已创建的 fetchP 进 Promise.race 被消费（无孤儿）；fix-must-fail (i) 退回裸 clock.sleep 会让
+// fetchP 成孤儿、晚到 fetch reject 触发 unhandledRejection。用带 __c33tag 的 reason 精确识别本段的晚到 reject。
+const c33Unhandled = [];
+process.on('unhandledRejection', (reason) => {
+  c33Unhandled.push(reason && reason.__c33tag ? reason.__c33tag : String(reason));
+});
 
 const tmpRoot = existsSync('D:/tmp') ? 'D:/tmp' : os.tmpdir();
 const dbPath = path.join(tmpRoot, `mp-sync-runner-smoke-${process.pid}-${Date.now()}.sqlite`);
@@ -28,6 +39,15 @@ const runner = await import('../server/utils/mp-sync-runner.ts');
 const { createSyncJob, getSyncJob, getJobAccount } = jobs;
 const { SyncConfigError, isRetryableErrorKind } = service;
 const { runSyncJob, runSyncJobPool, classifyAccountResult, ConcurrencyController } = runner;
+const {
+  ClockAbortError,
+  createRealClock,
+  normalizeRetryOptions,
+  assertTimeoutMs,
+  computeRawBackoff,
+  computeBackoffDelay,
+  withTimeout,
+} = runner;
 
 let passed = 0;
 function check(desc, cond) {
@@ -647,6 +667,731 @@ try {
     check('D10. 未调度账号保持 pending（d,e；调度门已闭，未继续 admit）', ['d10-d', 'd10-e'].every((f) => getJobAccount('job-pool-null', f).status === 'pending'));
     check('D10. job 未 finalize 成业务终态（保持 running，可进 C3-5 恢复）', getSyncJob('job-pool-null').status === 'running');
   }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // C3-3 测试基建：逻辑时钟（§2.1 结算协议）+ 驱动器 + 逻辑时钟感知假 fetcher
+  // ══════════════════════════════════════════════════════════════════════════
+
+  // 逻辑时钟：维护定时器堆，advance(ms) 按 (dueTime, seq) 稳定排序、**逐 timer** 结算——每轮只 pop 最早一项、
+  // settle 前先 now=due、settle 后过 setImmediate barrier（排空回调链微任务 + 让链上新注册的 timer 登记），
+  // 再 rescan（含 barrier 期间新注册且 due<=target 的项）。不进生产模块（生产只用 createRealClock）。
+  function createManualClock(startNow = 0) {
+    let now = startNow;
+    let seq = 0;
+    const timers = []; // 未结算定时器
+    let registered = 0; // 累计注册 sleep 次数（供“零 sleep 注册”断言）
+    const removeTimer = (t) => {
+      const i = timers.indexOf(t);
+      if (i >= 0) timers.splice(i, 1);
+      if (t.signal && t.onAbort) t.signal.removeEventListener('abort', t.onAbort);
+    };
+    return {
+      now: () => now,
+      sleep: (ms, opts) =>
+        new Promise((resolve, reject) => {
+          registered += 1;
+          const signal = opts?.signal;
+          if (signal?.aborted) {
+            reject(new ClockAbortError());
+            return;
+          }
+          const t = { dueTime: now + ms, seq: (seq += 1), settled: false, resolve, reject, signal, onAbort: null };
+          if (signal) {
+            t.onAbort = () => {
+              if (t.settled) return;
+              t.settled = true;
+              removeTimer(t);
+              t.reject(new ClockAbortError());
+            };
+            signal.addEventListener('abort', t.onAbort);
+          }
+          timers.push(t);
+        }),
+      async advance(ms) {
+        const target = now + ms;
+        await new Promise((r) => setImmediate(r)); // 先让已排队微任务落地（注册 sleep），再扫描
+        let guard = 0;
+        for (;;) {
+          if ((guard += 1) > 1_000_000) throw new Error('manualClock.advance: 结算迭代超上限（疑似无限注册）');
+          let pick = null;
+          for (const t of timers) {
+            if (t.settled || t.dueTime > target) continue;
+            if (!pick || t.dueTime < pick.dueTime || (t.dueTime === pick.dueTime && t.seq < pick.seq)) pick = t;
+          }
+          if (!pick) break;
+          now = pick.dueTime; // 先把时钟推进到该 timer 到点时刻，再结算（回调内 now()==该到点时刻）
+          pick.settled = true;
+          removeTimer(pick);
+          pick.resolve();
+          await new Promise((r) => setImmediate(r)); // event-loop barrier
+        }
+        now = target; // 收敛
+      },
+      pendingCount: () => timers.length,
+      registeredCount: () => registered,
+    };
+  }
+
+  // 驱动逻辑时钟把一个 pool/job promise 跑到 settle：advance 一大步（超过任何 dueTime），逐 timer 有序结算。
+  async function runToSettle(promise, clock, bigMs = 10_000_000) {
+    let done = false;
+    let ok = false;
+    let value;
+    let err;
+    promise.then(
+      (v) => { done = true; ok = true; value = v; },
+      (e) => { done = true; err = e; }
+    );
+    await clock.advance(bigMs);
+    for (let i = 0; i < 20 && !done; i += 1) await new Promise((r) => setImmediate(r));
+    if (!done) throw new Error('runToSettle: promise 未在时钟推进后 settle');
+    if (!ok) throw err;
+    return value;
+  }
+
+  // 推进逻辑时钟到指定 ms 后再取 promise 结果（用于 timeout 精确时序断言，不越过后续 dueTime）。
+  async function advanceThenAwait(promise, clock, ms) {
+    let done = false;
+    let ok = false;
+    let value;
+    let err;
+    promise.then(
+      (v) => { done = true; ok = true; value = v; },
+      (e) => { done = true; err = e; }
+    );
+    await clock.advance(ms);
+    for (let i = 0; i < 20 && !done; i += 1) await new Promise((r) => setImmediate(r));
+    if (!done) throw new Error(`advanceThenAwait: promise 未在 advance(${ms}) 后 settle`);
+    if (!ok) throw err;
+    return value;
+  }
+
+  // 逻辑时钟感知 fetcher：用 clock.sleep 模拟抓取延迟（可被 timeout 抢先），记录底层 fetch 活跃峰值。
+  function makeClockFetcher(clock, spec) {
+    const active = { count: 0, max: 0 };
+    const calls = {};
+    const fetchPage = async ({ fakeid, begin }) => {
+      calls[fakeid] = (calls[fakeid] ?? 0) + 1;
+      active.count += 1;
+      if (active.count > active.max) active.max = active.count;
+      try {
+        const s = spec[fakeid] ?? {};
+        await clock.sleep(s.latencyMs ?? 1000);
+        if (s.throwAfter) throw s.throwAfter({ begin, call: calls[fakeid] });
+        return { articles: [article(`${fakeid}-${begin}`, 2000)], hasMore: false };
+      } finally {
+        active.count -= 1;
+      }
+    };
+    return { fetchPage, calls, active };
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // E 段（C3-3）：纯函数 + 配置校验 + 真实 createRealClock.sleep + 逻辑时钟结算协议单测
+  // ══════════════════════════════════════════════════════════════════════════
+
+  // E1. computeRawBackoff（严格纯，R1-B4b）：精确指数序列 + 封顶 + base=0/指数溢出组合非 NaN。
+  {
+    const seq = [0, 1, 2, 3, 4].map((a) => computeRawBackoff(a, { baseDelayMs: 100, maxDelayMs: 1000 }));
+    check('E1. raw 指数序列 [100,200,400,800,封顶1000]', JSON.stringify(seq) === JSON.stringify([100, 200, 400, 800, 1000]));
+    check('E1. raw 单调不减', seq.every((v, i) => i === 0 || v >= seq[i - 1]));
+    check('E1. 缺省 base/max → 1000 起 / 封顶 30000', computeRawBackoff(0) === 1000 && computeRawBackoff(5, {}) === 30000);
+    check('E1. base=0 + attempt=40 → raw=0（非 NaN/Infinity，指数 cap 生效）', computeRawBackoff(40, { baseDelayMs: 0, maxDelayMs: 30000 }) === 0);
+    check('E1. base=0 + attempt=100 → raw=0（min(attempt,30) 封住 2**attempt 溢出）', computeRawBackoff(100, { baseDelayMs: 0, maxDelayMs: 30000 }) === 0);
+    check('E1. base>0 + attempt=100 → 封顶 30000 且有限', computeRawBackoff(100, { baseDelayMs: 1000, maxDelayMs: 30000 }) === 30000 && Number.isFinite(computeRawBackoff(100, { baseDelayMs: 1000, maxDelayMs: 30000 })));
+  }
+
+  // E2. computeBackoffDelay：identity-jitter == raw；full jitter ∈[0,raw]（只断范围）；越界 jitter fail-fast。
+  {
+    check('E2. identity-jitter → == raw', computeBackoffDelay(2, { baseDelayMs: 100, maxDelayMs: 1000, jitter: (d) => d }) === 400);
+    const raw3 = computeRawBackoff(3, { baseDelayMs: 100, maxDelayMs: 1000 }); // 800
+    let inRange = true;
+    for (let i = 0; i < 50; i += 1) {
+      const d = computeBackoffDelay(3, { baseDelayMs: 100, maxDelayMs: 1000 });
+      if (!(d >= 0 && d <= raw3)) inRange = false;
+    }
+    check('E2. full jitter 50 次均 ∈[0,raw]（只断范围、不断单调）', inRange);
+    let threw = 0;
+    for (const bad of [() => -1, () => NaN, () => Infinity, (d) => d + 1]) {
+      try {
+        computeBackoffDelay(1, { baseDelayMs: 100, maxDelayMs: 1000, jitter: bad });
+      } catch (e) {
+        if (e instanceof RangeError) threw += 1;
+      }
+    }
+    check('E2. 4 个越界 jitter（负/NaN/Infinity/>raw）均抛 RangeError（不静默 clamp）', threw === 4);
+  }
+
+  // E3. normalizeRetryOptions + assertTimeoutMs：非法值域 fail-fast RangeError；缺省填充；合法原样。
+  {
+    let threw = 0;
+    const bad = [
+      () => normalizeRetryOptions({ maxAttempts: 0 }),
+      () => normalizeRetryOptions({ maxAttempts: -1 }),
+      () => normalizeRetryOptions({ maxAttempts: 2.5 }),
+      () => normalizeRetryOptions({ maxAttempts: Infinity }),
+      () => normalizeRetryOptions({ baseDelayMs: -1 }),
+      () => normalizeRetryOptions({ baseDelayMs: NaN }),
+      () => normalizeRetryOptions({ maxDelayMs: Infinity }),
+      () => normalizeRetryOptions({ baseDelayMs: 5000, maxDelayMs: 1000 }),
+      () => normalizeRetryOptions({ maxDelayMs: 2_147_483_648 }),
+      () => assertTimeoutMs(0),
+      () => assertTimeoutMs(-1),
+      () => assertTimeoutMs(NaN),
+      () => assertTimeoutMs(Infinity),
+      () => assertTimeoutMs(2_147_483_648),
+    ];
+    for (const fn of bad) {
+      try {
+        fn();
+      } catch (e) {
+        if (e instanceof RangeError) threw += 1;
+      }
+    }
+    check('E3. 14 个非法 retry/timeout 配置全部抛 RangeError', threw === 14);
+    const n = normalizeRetryOptions();
+    check('E3. 缺省填充 maxAttempts=1 / base=1000 / max=30000 / jitter 为函数', n.maxAttempts === 1 && n.baseDelayMs === 1000 && n.maxDelayMs === 30000 && typeof n.jitter === 'function');
+    const n2 = normalizeRetryOptions({ maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 5000 });
+    check('E3. 合法值原样规范化', n2.maxAttempts === 3 && n2.baseDelayMs === 500 && n2.maxDelayMs === 5000);
+    let okNoThrow = true;
+    try {
+      assertTimeoutMs(100);
+      assertTimeoutMs(undefined);
+      assertTimeoutMs(2_147_483_647);
+    } catch {
+      okNoThrow = false;
+    }
+    check('E3. 合法 timeoutMs / undefined / 上限值 不抛', okNoThrow);
+  }
+
+  // E4. 真实 createRealClock.sleep（用小真实 ms 直测）：预 abort / 到期 / 中途 abort / 到期后再 abort 只结算一次。
+  {
+    const clock = createRealClock();
+    {
+      const ac = new AbortController();
+      ac.abort();
+      let err;
+      try {
+        await clock.sleep(50, { signal: ac.signal });
+      } catch (e) {
+        err = e;
+      }
+      check('E4. 预先 aborted → 立即 reject(ClockAbortError)', err instanceof ClockAbortError);
+    }
+    {
+      const t0 = Date.now();
+      await clock.sleep(5);
+      check('E4. 正常到期 resolve（>=~3ms）', Date.now() - t0 >= 3);
+    }
+    {
+      const ac = new AbortController();
+      const p = clock.sleep(2000, { signal: ac.signal });
+      setTimeout(() => ac.abort(), 5);
+      let err;
+      try {
+        await p;
+      } catch (e) {
+        err = e;
+      }
+      check('E4. 中途 abort → reject(ClockAbortError)', err instanceof ClockAbortError);
+    }
+    {
+      const ac = new AbortController();
+      await clock.sleep(3, { signal: ac.signal });
+      let okNoThrow = true;
+      try {
+        ac.abort(); // 到期后再 abort：settled 守卫 → no-op、不二次结算、无抛错
+      } catch {
+        okNoThrow = false;
+      }
+      check('E4. 到期后再 abort 不二次结算（settled 守卫，无抛错）', okNoThrow);
+    }
+  }
+
+  // E5. 逻辑时钟结算协议（R1-B4a）：稳定 FIFO + settle 前 now=due + 新注册重排 + 不提前结算 + abort 单次。
+  {
+    {
+      const clock = createManualClock();
+      const order = [];
+      clock.sleep(100).then(() => order.push(['a', clock.now()]));
+      clock.sleep(100).then(() => order.push(['b', clock.now()])); // 同 due，后注册 → FIFO 靠后
+      clock.sleep(50).then(() => order.push(['c', clock.now()]));
+      await clock.advance(100);
+      check('E5. 按 due 升序 + 同 due FIFO：c,a,b', JSON.stringify(order.map((o) => o[0])) === JSON.stringify(['c', 'a', 'b']));
+      check('E5. settle 前 now=due（回调内 now==该 timer 到点时刻）', order[0][1] === 50 && order[1][1] === 100 && order[2][1] === 100);
+    }
+    {
+      const clock = createManualClock();
+      const order = [];
+      clock.sleep(100).then(() => {
+        order.push(100);
+        clock.sleep(50).then(() => order.push('150-new')); // barrier 期间新注册 due=150
+      });
+      clock.sleep(200).then(() => order.push(200));
+      await clock.advance(200);
+      check('E5. 新注册 due=150 排到原有 due=200 之前结算（每轮只 pop 最早一项）', JSON.stringify(order) === JSON.stringify([100, '150-new', 200]));
+    }
+    {
+      const clock = createManualClock();
+      const seen = [];
+      clock.sleep(100).then(() => {
+        seen.push(`first@${clock.now()}`);
+        clock.sleep(100).then(() => seen.push(`second@${clock.now()}`)); // 链式累计到点 200
+      });
+      await clock.advance(150);
+      check('E5. advance(150)：首个(due100)结算、链式(due200>150)不提前结算', JSON.stringify(seen) === JSON.stringify(['first@100']));
+      check('E5. 链式项 pending、now=150', clock.pendingCount() === 1 && clock.now() === 150);
+      await clock.advance(100); // now→250
+      check('E5. 再 advance 到 250 → 链式 second@200 结算', seen.includes('second@200'));
+    }
+    {
+      const clock = createManualClock();
+      const ac = new AbortController();
+      let err;
+      const p = clock.sleep(100, { signal: ac.signal }).catch((e) => {
+        err = e;
+      });
+      ac.abort();
+      ac.abort(); // 重复 abort
+      await p;
+      check('E5. manual sleep abort → reject(ClockAbortError)，重复 abort 只结算一次、pending 归零', err instanceof ClockAbortError && clock.pendingCount() === 0);
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // F 段（C3-3）：退避重试 / 软 timeout / 每 attempt 降档 / 逻辑 vs 真实 fetch 峰值 /
+  //              非法配置零副作用 / timeout scheduler 故障 = 受控业务 outcome（R2-C3-3-1）
+  // ══════════════════════════════════════════════════════════════════════════
+
+  // F1. 可重试(429)重试到成功：退避序列驱动、最终 succeeded、retry_count 精确 0、观测 attempts。
+  {
+    createSyncJob({ id: 'job-f1', requestedSince: 1000, accounts: [{ fakeid: 'acc-f1' }] });
+    const clock = createManualClock();
+    const { fetchPage, calls } = makeRoutingFetcher({
+      'acc-f1': ({ call }) => {
+        if (call <= 2) {
+          const e = new Error('rate limited');
+          e.status = 429;
+          throw e;
+        }
+        return { articles: [article('f1-ok', 2000)], hasMore: false };
+      },
+    });
+    const res = await runToSettle(
+      runSyncJob('job-f1', { fetchPage, clock, retry: { maxAttempts: 3, baseDelayMs: 100, maxDelayMs: 1000, jitter: (d) => d } }),
+      clock
+    );
+    const acc = getJobAccount('job-f1', 'acc-f1');
+    check('F1. 重试到成功 → succeeded', acc.status === 'succeeded');
+    check('F1. fetcher 被调用 3 次（2×429 + 1 成功）', calls['acc-f1'] === 3);
+    check('F1. 成功不 bump → retry_count 精确 0', acc.retryCount === 0);
+    check('F1. 观测 attempts=3', res.accounts[0].attempts === 3);
+    check('F1. 退避 sleep 注册 2 次（两次重试各一次）', clock.registeredCount() === 2);
+    check('F1. job=completed', res.job.status === 'completed');
+  }
+
+  // F2. config_error（通道 A 抛）不重试 + 抛出型 attempt 也发信号（关闭 B1）。用 limit=1 顺序化 + healthy streak
+  //     重置观测：cfg 若不发信号则 streak 不被打断、末尾 success 触发升档 → finalLimit 变 2（本用例断言 =1）。
+  {
+    createSyncJob({
+      id: 'job-f2',
+      requestedSince: 1000,
+      accounts: [{ fakeid: 'f2-sa', priority: 9 }, { fakeid: 'f2-cfg', priority: 8 }, { fakeid: 'f2-sb', priority: 7 }],
+    });
+    const clock = createManualClock();
+    const { fetchPage, calls } = makeRoutingFetcher({
+      'f2-sa': () => ({ articles: [article('sa', 2000)], hasMore: false }),
+      'f2-cfg': () => {
+        throw new Error('通道A 不应触达 fetchPage');
+      },
+      'f2-sb': () => ({ articles: [article('sb', 2000)], hasMore: false }),
+    });
+    const res = await runToSettle(
+      runSyncJobPool(
+        'job-f2',
+        { fetchPage, clock, resolveOptions: (acc) => (acc.fakeid === 'f2-cfg' ? { pageSize: 0 } : {}) },
+        { levels: [1, 2], startIndex: 0, healthyStreakToRaise: 2 }
+      ),
+      clock
+    );
+    check('F2. 通道A config_error 账号零网络 failed', (calls['f2-cfg'] ?? 0) === 0 && getJobAccount('job-f2', 'f2-cfg').errorCode === 'config_error');
+    check('F2. 抛出型 config_error attempt 确发信号（重置 healthy streak → 末尾 success 不升档 → finalLimit=1）', res.concurrency.finalLimit === 1);
+    check('F2. 两正常账号 succeeded', getJobAccount('job-f2', 'f2-sa').status === 'succeeded' && getJobAccount('job-f2', 'f2-sb').status === 'succeeded');
+    check('F2. config_error 不重试 → 零退避 sleep 注册', clock.registeredCount() === 0);
+  }
+
+  // F3. auth_required → 不退避不重试、账号 auth_required 终态、降到最低档。
+  {
+    createSyncJob({ id: 'job-f3', requestedSince: 1000, accounts: [{ fakeid: 'f3' }] });
+    const clock = createManualClock();
+    const { fetchPage, calls } = makeRoutingFetcher({
+      f3: () => {
+        const e = new Error('unauthorized');
+        e.status = 401;
+        throw e;
+      },
+    });
+    const res = await runToSettle(
+      runSyncJobPool('job-f3', { fetchPage, clock, retry: { maxAttempts: 5, baseDelayMs: 100, maxDelayMs: 1000, jitter: (d) => d } }, { startIndex: 2, healthyStreakToRaise: 100000 }),
+      clock
+    );
+    check('F3. auth_required 账号终态', getJobAccount('job-f3', 'f3').status === 'auth_required');
+    check('F3. auth_required 不重试（fetcher 1 次，即便 maxAttempts=5）', calls['f3'] === 1);
+    check('F3. auth_required 零退避 sleep', clock.registeredCount() === 0);
+    check('F3. auth_required → 降到最低档 finalLimit=1', res.concurrency.finalLimit === 1);
+  }
+
+  // F4. per-page 软 timeout（B2 四路径 + 同步 throw）。
+  // F4a. fetch 先赢（latency 50 < timeout 100）：succeeded + finally abort → 结束后 pending 定时器归零（守 fix-must-fail c）。
+  {
+    createSyncJob({ id: 'job-f4a', requestedSince: 1000, accounts: [{ fakeid: 'f4a' }] });
+    const clock = createManualClock();
+    const { fetchPage } = makeClockFetcher(clock, { f4a: { latencyMs: 50 } });
+    const res = await advanceThenAwait(runSyncJob('job-f4a', { fetchPage, clock, timeoutMs: 100 }), clock, 60); // 推进到 60：fetch(50) 结算、timeout(100) 未到
+    check('F4a. fetch 先赢 → succeeded', getJobAccount('job-f4a', 'f4a').status === 'succeeded' && res.job.status === 'completed');
+    check('F4a. finally abort timeout 定时器 → 结束后 pending 归零（timeout 未空等到 100）', clock.pendingCount() === 0);
+  }
+
+  // F4b. timeout 先赢（latency 200 > timeout 100）：failed(timeout)、摘要 retryable=true。
+  {
+    createSyncJob({ id: 'job-f4b', requestedSince: 1000, accounts: [{ fakeid: 'f4b' }] });
+    const clock = createManualClock();
+    const { fetchPage } = makeClockFetcher(clock, { f4b: { latencyMs: 200 } });
+    const res = await runToSettle(runSyncJob('job-f4b', { fetchPage, clock, timeoutMs: 100 }), clock);
+    const acc = getJobAccount('job-f4b', 'f4b');
+    check('F4b. timeout 先赢 → failed(timeout)', acc.status === 'failed' && acc.errorCode === 'timeout');
+    check('F4b. 摘要 retryable=true（timeout 可重试）', res.accounts[0].retryable === true);
+  }
+
+  // F4c. timeout 先赢后底层 fetch 晚 resolve → 无第二 outcome（仍 failed/timeout）、retry_count 精确 1。
+  {
+    createSyncJob({ id: 'job-f4c', requestedSince: 1000, accounts: [{ fakeid: 'f4c' }] });
+    const clock = createManualClock();
+    const { fetchPage } = makeClockFetcher(clock, { f4c: { latencyMs: 200 } });
+    await runToSettle(runSyncJob('job-f4c', { fetchPage, clock, timeoutMs: 100 }), clock);
+    const acc = getJobAccount('job-f4c', 'f4c');
+    check('F4c. timeout 先赢后 fetch 晚 resolve → 无第二 outcome（仍 failed/timeout）', acc.status === 'failed' && acc.errorCode === 'timeout');
+    check('F4c. 单次 processAccount 落库一次 → retry_count 精确 1', acc.retryCount === 1);
+  }
+
+  // F4d. timeout 先赢后底层 fetch 晚 reject → 无第二 outcome + 无 unhandledRejection（race 已消费晚到 reject）。
+  {
+    createSyncJob({ id: 'job-f4d', requestedSince: 1000, accounts: [{ fakeid: 'f4d' }] });
+    const clock = createManualClock();
+    const uhBefore = c33Unhandled.length;
+    const { fetchPage } = makeClockFetcher(clock, {
+      f4d: {
+        latencyMs: 200,
+        throwAfter: () => {
+          const e = new Error('fetch failed later');
+          e.__c33tag = 'f4d-late';
+          return e;
+        },
+      },
+    });
+    await runToSettle(runSyncJob('job-f4d', { fetchPage, clock, timeoutMs: 100 }), clock);
+    const acc = getJobAccount('job-f4d', 'f4d');
+    check('F4d. timeout 先赢后 fetch 晚 reject → 无第二 outcome（仍 failed/timeout）', acc.status === 'failed' && acc.errorCode === 'timeout');
+    await new Promise((r) => setTimeout(r, 20));
+    check('F4d. 晚到 fetch reject 无 unhandledRejection（race 已装 handler 消费）', !c33Unhandled.slice(uhBefore).includes('f4d-late'));
+  }
+
+  // F4e. fetcher 同步 throw：归类 api_error（500）且定时器仍清理。
+  {
+    createSyncJob({ id: 'job-f4e', requestedSince: 1000, accounts: [{ fakeid: 'f4e' }] });
+    const clock = createManualClock();
+    const fetchPage = () => {
+      const e = new Error('sync boom');
+      e.status = 500;
+      throw e; // 同步 throw
+    };
+    await runToSettle(runSyncJob('job-f4e', { fetchPage, clock, timeoutMs: 100 }), clock);
+    const acc = getJobAccount('job-f4e', 'f4e');
+    check('F4e. fetcher 同步 throw → 归类 api_error（500）', acc.status === 'failed' && acc.errorCode === 'api_error');
+    check('F4e. 同步 throw 也清定时器（结束后 pending=0）', clock.pendingCount() === 0);
+  }
+
+  // F5. 每次 attempt 降档（§2.5/B1）：单账号 429,429,succeeded → 中途两次 rate_limited 已把档降到 1，
+  //     即便最终成功 finalLimit 仍=1（守 fix-must-fail d：若只在最终态发信号则只见 succeeded、finalLimit=4）。
+  {
+    createSyncJob({ id: 'job-f5', requestedSince: 1000, accounts: [{ fakeid: 'f5' }] });
+    const clock = createManualClock();
+    const { fetchPage, calls } = makeRoutingFetcher({
+      f5: ({ call }) => {
+        if (call <= 2) {
+          const e = new Error('rl');
+          e.status = 429;
+          throw e;
+        }
+        return { articles: [article('f5ok', 2000)], hasMore: false };
+      },
+    });
+    const res = await runToSettle(
+      runSyncJobPool('job-f5', { fetchPage, clock, retry: { maxAttempts: 3, baseDelayMs: 100, maxDelayMs: 1000, jitter: (d) => d } }, { startIndex: 2, healthyStreakToRaise: 100000 }),
+      clock
+    );
+    check('F5. 中途 429 已降档：finalLimit=1（证明每 attempt 都发信号、非只看最终成功态）', res.concurrency.finalLimit === 1);
+    check('F5. 账号最终 succeeded', getJobAccount('job-f5', 'f5').status === 'succeeded');
+    check('F5. fetcher 3 次', calls['f5'] === 3);
+  }
+
+  // F6. 逻辑 worker 峰值 ≠ 真实 fetch 峰值（B3）：单账号软 timeout 恒超时 + 重试 → 旧 fetch 与新 fetch 重叠。
+  {
+    createSyncJob({ id: 'job-f6', requestedSince: 1000, accounts: [{ fakeid: 'f6' }] });
+    const clock = createManualClock();
+    const { fetchPage, active } = makeClockFetcher(clock, { f6: { latencyMs: 1000 } }); // 恒 > timeout(100)
+    const res = await runToSettle(
+      runSyncJobPool('job-f6', { fetchPage, clock, timeoutMs: 100, retry: { maxAttempts: 2, baseDelayMs: 50, maxDelayMs: 50, jitter: (d) => d } }, { startIndex: 2, healthyStreakToRaise: 100000 }),
+      clock
+    );
+    check('F6. 逻辑账号 worker 峰值=1（单账号）', res.concurrency.maxInFlight === 1);
+    check('F6. 底层 fetch 活跃峰值=2（软 timeout 下旧 fetch 与重试新 fetch 重叠）', active.max === 2);
+    check('F6. 逻辑 worker 峰值 < 底层 fetch 峰值（B3：二者可不同）', res.concurrency.maxInFlight < active.max);
+    check('F6. 两次都超时 → failed(timeout)', getJobAccount('job-f6', 'f6').status === 'failed' && getJobAccount('job-f6', 'f6').errorCode === 'timeout');
+  }
+
+  // F7. maxAttempts 耗尽 → failed、末次 errorKind、retry_count 精确 1、摘要 retryable=true 但停止重试。
+  {
+    createSyncJob({ id: 'job-f7', requestedSince: 1000, accounts: [{ fakeid: 'acc-f7' }] });
+    const clock = createManualClock();
+    const { fetchPage, calls } = makeRoutingFetcher({
+      'acc-f7': () => {
+        const e = new Error('rl');
+        e.status = 429;
+        throw e; // 恒 429
+      },
+    });
+    const res = await runToSettle(
+      runSyncJob('job-f7', { fetchPage, clock, retry: { maxAttempts: 3, baseDelayMs: 100, maxDelayMs: 1000, jitter: (d) => d } }),
+      clock
+    );
+    const acc = getJobAccount('job-f7', 'acc-f7');
+    check('F7. 耗尽 → failed', acc.status === 'failed');
+    check('F7. 末次 errorKind=rate_limited', acc.errorCode === 'rate_limited');
+    check('F7. fetcher 被调用 3 次（= maxAttempts）', calls['acc-f7'] === 3);
+    check('F7. 耗尽 bump → retry_count 精确 1', acc.retryCount === 1);
+    check('F7. 观测 attempts=3', res.accounts[0].attempts === 3);
+    check('F7. 退避 sleep 注册 2 次（3 attempt 之间 2 次退避）', clock.registeredCount() === 2);
+    check('F7. 摘要 retryable=true 但已停止重试', res.accounts[0].retryable === true);
+    check('F7. job=failed', res.job.status === 'failed');
+  }
+
+  // F-gen. B4·可重放快照（fix-must-fail g）：knownAids 为一次性 generator，重试后仍去重（否则第二 attempt 去重失效）。
+  {
+    createSyncJob({ id: 'job-fg', requestedSince: 1000, accounts: [{ fakeid: 'fg' }] });
+    const clock = createManualClock();
+    function* knownGen() {
+      yield 'dup-1';
+      yield 'dup-2';
+    }
+    const { fetchPage, calls } = makeRoutingFetcher({
+      fg: ({ call }) => {
+        if (call === 1) {
+          const e = new Error('rl');
+          e.status = 429;
+          throw e; // 首次 429 触发重试
+        }
+        return { articles: [article('dup-1', 2000), article('new-1', 1990)], hasMore: false }; // dup-1 应被去重
+      },
+    });
+    const res = await runToSettle(
+      runSyncJob('job-fg', { fetchPage, clock, retry: { maxAttempts: 3, baseDelayMs: 100, maxDelayMs: 1000, jitter: (d) => d }, resolveOptions: () => ({ knownAids: knownGen() }) }),
+      clock
+    );
+    const acc = getJobAccount('job-fg', 'fg');
+    check('F-gen. 重试后成功', acc.status === 'succeeded');
+    check('F-gen. 一次性 generator 已快照 → 第二 attempt 仍去重（dup-1 去掉、仅 new-1 入账 newArticles=1）', acc.newArticles === 1);
+    check('F-gen. fetcher 2 次（429 + 成功）', calls['fg'] === 2);
+    check('F-gen. job=completed', res.job.status === 'completed');
+  }
+
+  // F8. 系统故障传播（B1/§2.8 调用点①，fix-must-fail f）：坏**退避** clock.sleep（窄 catch 外）→ 顺序版
+  //     runSyncJob reject、故障账号不落 unexpected_error、job 不 finalize、后续账号不处理。
+  {
+    createSyncJob({ id: 'job-f8', requestedSince: 1000, accounts: [{ fakeid: 'f8-a', priority: 9 }, { fakeid: 'f8-b', priority: 1 }] });
+    const badBackoffClock = {
+      now: () => 0,
+      sleep: () => {
+        throw new Error('backoff clock failure');
+      },
+    };
+    const { fetchPage, calls } = makeRoutingFetcher({
+      'f8-a': () => {
+        const e = new Error('rl');
+        e.status = 429;
+        throw e; // 429 可重试 → 触发退避 → 坏 clock 抛
+      },
+      'f8-b': () => ({ articles: [article('b', 2000)], hasMore: false }),
+    });
+    let rej;
+    try {
+      await runSyncJob('job-f8', { fetchPage, clock: badBackoffClock, retry: { maxAttempts: 3, baseDelayMs: 100, maxDelayMs: 1000 } });
+    } catch (e) {
+      rej = e;
+    }
+    check('F8. 坏退避 clock.sleep（窄 catch 外）→ 系统故障向上 reject（非账号 unexpected_error）', rej instanceof Error && /backoff clock failure/.test(rej.message));
+    check('F8. 故障账号 f8-a 未落 unexpected_error 终态（保持 running）', getJobAccount('job-f8', 'f8-a').status === 'running');
+    check('F8. job 未 finalize（保持 running，交 C3-5 恢复）', getSyncJob('job-f8').status === 'running');
+    check('F8. 后续账号 f8-b 未处理（顺序版首账号故障即中断，保持 pending 零网络）', getJobAccount('job-f8', 'f8-b').status === 'pending' && (calls['f8-b'] ?? 0) === 0);
+  }
+
+  // F9. 默认 OFF 全等价（retry 缺省 + timeoutMs=undefined）：完全不触碰逻辑时钟 sleep、不包 withTimeout。
+  {
+    createSyncJob({ id: 'job-f9', requestedSince: 1000, accounts: [{ fakeid: 'f9-a', priority: 9 }, { fakeid: 'f9-b', priority: 1 }] });
+    const clock = createManualClock();
+    const { fetchPage } = makeRoutingFetcher({
+      'f9-a': () => ({ articles: [article('a', 2000)], hasMore: false }),
+      'f9-b': () => ({ articles: [article('b', 2000)], hasMore: false }),
+    });
+    const res = await runSyncJob('job-f9', { fetchPage, clock }); // 无 retry / 无 timeoutMs → 默认 OFF；无 clock.sleep 需推进
+    check('F9. 默认 OFF：完全不触碰逻辑时钟 sleep（注册数=0）', clock.registeredCount() === 0);
+    check('F9. 默认 OFF：全 succeeded、job completed', res.job.status === 'completed' && res.accounts.every((a) => a.status === 'succeeded'));
+    check('F9. 默认 OFF：观测 attempts=1', res.accounts.every((a) => a.attempts === 1));
+  }
+
+  // F10. auth 聚合：单 auth → job=failed；success+auth → job=partial。
+  {
+    createSyncJob({ id: 'job-f10a', requestedSince: 1000, accounts: [{ fakeid: 'a10a' }] });
+    const c1 = createManualClock();
+    const { fetchPage: fp1 } = makeRoutingFetcher({
+      a10a: () => {
+        const e = new Error('401');
+        e.status = 401;
+        throw e;
+      },
+    });
+    const r1 = await runSyncJob('job-f10a', { fetchPage: fp1, clock: c1 });
+    check('F10a. 单 auth 账号 → job=failed', r1.job.status === 'failed');
+    createSyncJob({ id: 'job-f10b', requestedSince: 1000, accounts: [{ fakeid: 'a10b-ok', priority: 9 }, { fakeid: 'a10b-auth', priority: 1 }] });
+    const c2 = createManualClock();
+    const { fetchPage: fp2 } = makeRoutingFetcher({
+      'a10b-ok': () => ({ articles: [article('ok', 2000)], hasMore: false }),
+      'a10b-auth': () => {
+        const e = new Error('403');
+        e.status = 403;
+        throw e;
+      },
+    });
+    const r2 = await runSyncJob('job-f10b', { fetchPage: fp2, clock: c2 });
+    check('F10b. success+auth 混合 → job=partial', r2.job.status === 'partial');
+  }
+
+  // F11. 非法配置零持久副作用（R1-B2·B4 验收，fix-must-fail h）：顺序版 + 并发版注入非法 retry/timeout →
+  //      reject(RangeError)、job 仍 queued、账号仍 pending、fetch=0、sleep=0（校验严格前置于 startJob）。
+  {
+    createSyncJob({ id: 'job-f11a', requestedSince: 1000, accounts: [{ fakeid: 'f11a' }] });
+    const clock = createManualClock();
+    const fa = makeRoutingFetcher({ f11a: () => ({ articles: [], hasMore: false }) });
+    let rej;
+    try {
+      await runSyncJob('job-f11a', { fetchPage: fa.fetchPage, clock, retry: { maxAttempts: 0 } });
+    } catch (e) {
+      rej = e;
+    }
+    check('F11a. 顺序版非法 maxAttempts=0 → reject(RangeError)', rej instanceof RangeError);
+    check('F11a. job 仍 queued（未 startJob）', getSyncJob('job-f11a').status === 'queued');
+    check('F11a. 账号仍 pending、fetcher 0 次、sleep 0 次（零持久/网络副作用）', getJobAccount('job-f11a', 'f11a').status === 'pending' && Object.keys(fa.calls).length === 0 && clock.registeredCount() === 0);
+
+    createSyncJob({ id: 'job-f11b', requestedSince: 1000, accounts: [{ fakeid: 'f11b' }] });
+    const clock2 = createManualClock();
+    const fb = makeRoutingFetcher({ f11b: () => ({ articles: [], hasMore: false }) });
+    let rej2;
+    try {
+      await runSyncJobPool('job-f11b', { fetchPage: fb.fetchPage, clock: clock2, timeoutMs: -1 });
+    } catch (e) {
+      rej2 = e;
+    }
+    check('F11b. 并发版非法 timeoutMs=-1 → reject(RangeError)', rej2 instanceof RangeError);
+    check('F11b. job 仍 queued、账号 pending、fetch=0、sleep=0', getSyncJob('job-f11b').status === 'queued' && getJobAccount('job-f11b', 'f11b').status === 'pending' && Object.keys(fb.calls).length === 0 && clock2.registeredCount() === 0);
+
+    createSyncJob({ id: 'job-f11c', requestedSince: 1000, accounts: [{ fakeid: 'f11c' }] });
+    const clock3 = createManualClock();
+    const fcc = makeRoutingFetcher({ f11c: () => ({ articles: [], hasMore: false }) });
+    let rej3;
+    try {
+      await runSyncJob('job-f11c', { fetchPage: fcc.fetchPage, clock: clock3, timeoutMs: 2_147_483_648 });
+    } catch (e) {
+      rej3 = e;
+    }
+    check('F11c. timeoutMs 超真实定时器上限 → reject(RangeError)、job 仍 queued', rej3 instanceof RangeError && getSyncJob('job-f11c').status === 'queued');
+  }
+
+  // F12. timeout scheduler 故障 = 受控业务 outcome（R2-C3-3-1，非 fatal/drain）。
+  // F12a. scheduler 同步 throw：账号 failed(api_error)、job 正常 finalize、晚到 fetch reject 无 unhandledRejection
+  //       （fix-must-fail i：退回裸 clock.sleep 会让 fetchP 成孤儿 → 本 unhandledRejection 断言变红）。
+  {
+    createSyncJob({ id: 'job-f12a', requestedSince: 1000, accounts: [{ fakeid: 'f12a' }] });
+    const uhBefore = c33Unhandled.length;
+    let lateReject;
+    const controlled = new Promise((_resolve, reject) => {
+      lateReject = reject;
+    });
+    const fetchPage = () => controlled; // 返回受控 pending promise（稍后 test 触发晚到 reject）
+    const badTimeoutClock = {
+      now: () => 0,
+      sleep: () => {
+        throw new Error('clock failure'); // 同步 throw（无 timeout/network 特征 → 兜底 api_error）
+      },
+    };
+    const res = await runSyncJob('job-f12a', { fetchPage, clock: badTimeoutClock, timeoutMs: 100 });
+    const acc = getJobAccount('job-f12a', 'f12a');
+    check('F12a. scheduler 同步 throw → 账号 failed(api_error)（受控业务 outcome，非 fatal）', acc.status === 'failed' && acc.errorCode === 'api_error');
+    check('F12a. job 正常 finalize=failed（未 drain/未保持 running）', res.job.status === 'failed');
+    lateReject({ __c33tag: 'f12a-late', message: 'late fetch after abandon' }); // 触发孤儿候选 fetchP 的晚到 reject
+    await new Promise((r) => setTimeout(r, 20));
+    check('F12a. 晚到 fetch reject 无 unhandledRejection（fetchP 已进 race 被消费、非孤儿）', !c33Unhandled.slice(uhBefore).includes('f12a-late'));
+  }
+
+  // F12b. scheduler 异步 spurious reject（非 ClockAbortError、无 timeout/network 特征）→ 同 12a 归类 api_error、受控隔离。
+  {
+    createSyncJob({ id: 'job-f12b', requestedSince: 1000, accounts: [{ fakeid: 'f12b' }] });
+    const uhBefore = c33Unhandled.length;
+    let lateReject;
+    const controlled = new Promise((_resolve, reject) => {
+      lateReject = reject;
+    });
+    const fetchPage = () => controlled;
+    const badTimeoutClock = {
+      now: () => 0,
+      sleep: () => Promise.reject(new Error('clock failure')), // 异步 spurious reject
+    };
+    const res = await runSyncJob('job-f12b', { fetchPage, clock: badTimeoutClock, timeoutMs: 100 });
+    const acc = getJobAccount('job-f12b', 'f12b');
+    check('F12b. scheduler spurious reject → 账号 failed(api_error)（受控业务 outcome）', acc.status === 'failed' && acc.errorCode === 'api_error');
+    check('F12b. job 正常 finalize=failed', res.job.status === 'failed');
+    lateReject({ __c33tag: 'f12b-late', message: 'late fetch' });
+    await new Promise((r) => setTimeout(r, 20));
+    check('F12b. 无 unhandledRejection', !c33Unhandled.slice(uhBefore).includes('f12b-late'));
+  }
+
+  // F12c. 对照：坏**退避** clock.sleep（窄 catch 外）→ 仍 fatal/drain（并发版 pool reject），证两调用点边界确不同。
+  {
+    createSyncJob({ id: 'job-f12c', requestedSince: 1000, accounts: [{ fakeid: 'f12c-a', priority: 9 }, { fakeid: 'f12c-b', priority: 8 }] });
+    const badBackoffClock = {
+      now: () => 0,
+      sleep: () => {
+        throw new Error('backoff clock failure');
+      },
+    };
+    const { fetchPage } = makeRoutingFetcher({
+      'f12c-a': () => {
+        const e = new Error('rl');
+        e.status = 429;
+        throw e; // 429 → 退避 → 坏 clock 抛（窄 catch 外）
+      },
+      'f12c-b': () => ({ articles: [article('b', 2000)], hasMore: false }),
+    });
+    let rej;
+    try {
+      await runSyncJobPool('job-f12c', { fetchPage, clock: badBackoffClock, retry: { maxAttempts: 3, baseDelayMs: 100, maxDelayMs: 1000 } }, { startIndex: 2, healthyStreakToRaise: 100000 });
+    } catch (e) {
+      rej = e;
+    }
+    check('F12c. 对照：坏退避 clock → pool fatal-drain reject（≠ timeout scheduler 的受控 outcome）', rej instanceof Error && /backoff clock failure/.test(rej.message));
+    check('F12c. job 未 finalize（保持 running）', getSyncJob('job-f12c').status === 'running');
+  }
+
+  check('F12. 全程无残留 unhandledRejection（正确实现下 c33Unhandled 为空）', c33Unhandled.length === 0);
 
   console.log(`\nPASS smoke_mp_sync_runner: ${passed} assertions`);
 } catch (err) {

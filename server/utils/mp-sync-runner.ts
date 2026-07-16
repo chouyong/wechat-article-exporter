@@ -3,6 +3,7 @@
 import {
   syncSingleAccount,
   SyncConfigError,
+  SyncFetchError,
   isRetryableErrorKind,
   type PageFetcher,
   type SyncAccountOptions,
@@ -54,6 +55,8 @@ export interface AccountRunResult {
   /** isRetryableErrorKind(errorKind) 的结果；succeeded / 未知 / config_error 均为 false（fail-closed）。 */
   retryable: boolean;
   errorMessage: string | null;
+  /** C3-3 观测：本账号实际尝试次数（含首次）；由 runWithRetry 填充，**非持久**、仅观测。 */
+  attempts?: number;
 }
 
 /** classifyAccountResult 的输入：要么是 service 返回的 outcome，要么是 service 抛出的错误。 */
@@ -148,6 +151,22 @@ export interface RunSyncJobDeps {
    * 生产默认不传，走 service 默认（pageSize=20 / maxPages=500）。离线测试用它触发真实通道 A/B，不桩掉 service。
    */
   resolveOptions?: (account: MpSyncJobAccount, job: MpSyncJob) => Partial<Omit<SyncAccountOptions, 'fakeid' | 'startBegin'>>;
+  /**
+   * C3-3：注入时钟，退避 sleep 与 per-page timeout 均经此。默认 `createRealClock()`（Date.now + setTimeout）。
+   * 离线测试注入逻辑时钟（smoke `createManualClock`）以零真实等待、确定性推进退避/超时时序。
+   */
+  clock?: RunnerClock;
+  /**
+   * C3-3：账号级退避重试策略。默认 `{ maxAttempts: 1 }`（**不重试**，与 C3-1/C3-2 完全等价、锁 145 既有回归）。
+   * `baseDelayMs`/`maxDelayMs` 缺省 1000/30000；`jitter` 缺省 full jitter。入口 `normalizeRetryOptions` 校验。
+   */
+  retry?: RetryPolicyOptions;
+  /**
+   * C3-3：per-page **软** timeout（ms）。默认 `undefined`（不启用，`fetchPage` 原样传入）。启用时用同签名
+   * `withTimeout` 装饰器包裹，判定超时后归类为可重试 `timeout`，但**不主动中止在飞网络**（PageFetcher 无
+   * AbortSignal；真实中止 = 改生产契约 = 重新授权门 / C3-7）。入口 `assertTimeoutMs` 校验。
+   */
+  timeoutMs?: number;
 }
 
 export interface RunSyncJobResult {
@@ -159,20 +178,27 @@ export interface RunSyncJobResult {
  * 单账号一次同步的完整处理单元：供顺序 runSyncJob 与并发 runSyncJobPool **共用同一语义源**
  * （失败隔离 / 系统故障传播 / startBegin 固定，两条编排路径逐字一致，差异只在“同时跑几个账号”）。
  *
- * 边界（F1/C3-1-F1）：try/catch **只**包住 syncSingleAccount，把它的抛错（通道 A 的 SyncConfigError /
- * 防御性未预期错误）翻译成该账号失败终态。**resolveOptions 求值 + options 组装在 try 之外、且在
- * markAccountRunning 之前**——resolver / 依赖配置器抛错属系统故障，原样向上抛（顺序版使 runSyncJob
- * reject；并发版由 runSyncJobPool 调度器捕获后停止调度、排空在飞再 reject），绝不伪装成账号业务失败、
- * 不迁移状态、不续跑；置于 markAccountRunning 之前 → resolver 抛错时账号连状态迁移都不发生、保持 pending。
- * applyAccountOutcome / 状态机原语的抛错同属真实不变量违规，也在 catch 之外、故意不吞（向上抛）。
- * startBegin 固定 0（F2/C3-1-F2）置于展开 overrides 之后作运行时第二层防御：C3-1/C3-2 不做断点续跑（C3-5）；
- * 即便 resolver 经非类型安全输入返回 startBegin，也被此处 0 覆盖。
+ * 边界（F1/C3-1-F1，C3-3 保持）：每次 attempt 的窄 try/catch **只**包住 syncSingleAccount（见 runWithRetry），
+ * 把它的抛错（通道 A 的 SyncConfigError / 防御性未预期错误）翻译成该账号失败终态。**resolveOptions 求值 +
+ * options 组装在重试循环之外、且在 markAccountRunning 之前**——resolver / 依赖配置器抛错属系统故障，原样
+ * 向上抛（顺序版使 runSyncJob reject；并发版由 runSyncJobPool 调度器捕获后停止调度、排空在飞再 reject），
+ * 绝不伪装成账号业务失败、不迁移状态、不续跑；置于 markAccountRunning 之前 → resolver 抛错时账号连状态迁移
+ * 都不发生、保持 pending。applyAccountOutcome / 状态机原语的抛错同属真实不变量违规，也在窄 catch 之外、故意
+ * 不吞（向上抛）。startBegin 固定 0（F2/C3-1-F2）置于展开 overrides 之后作运行时第二层防御。
+ *
+ * C3-3 增量：① B4·可重放快照——knownAids/knownLinks 若为一次性 generator，重试前快照成数组，保证每 attempt
+ * 去重集可重放；② 若 ctx.timeoutMs 提供，用同签名 withTimeout 装饰 fetchPage（per-page 软 timeout，§2.7）；
+ * ③ 退避重试收进 runWithRetry（每 attempt 恰 emit 一次升降档信号 §2.5；退避 sleep 故障在窄 catch 外原样
+ * 上抛 §2.4/§2.8）；④ applyAccountOutcome 仍**只在循环后调一次**（最终 outcome）→ retry_count 每次
+ * processAccount 至多 +1（重试成功精确 0、耗尽精确 1）。
  */
 async function processAccount(
   jobId: string,
   account: MpSyncJobAccount,
   job: MpSyncJob,
-  deps: RunSyncJobDeps
+  deps: RunSyncJobDeps,
+  ctx: ResolvedRetryContext,
+  emitSignal: (signal: ConcurrencySignal) => void
 ): Promise<AccountRunResult> {
   const overrides = deps.resolveOptions?.(account, job);
   const options: SyncAccountOptions = {
@@ -181,33 +207,47 @@ async function processAccount(
     ...overrides,
     startBegin: 0,
   };
+  // B4/§2.4·可重放快照：一次性 generator 快照成数组，保证每 attempt 复用同一去重集（否则第二 attempt 去重失效）。
+  if (options.knownAids !== undefined) options.knownAids = [...options.knownAids];
+  if (options.knownLinks !== undefined) options.knownLinks = [...options.knownLinks];
 
   markAccountRunning(jobId, account.fakeid); // pending -> running
 
-  let classified: ReturnType<typeof classifyAccountResult>;
-  try {
-    const outcome = await syncSingleAccount(options, deps.fetchPage);
-    classified = classifyAccountResult(account.fakeid, { ok: true, outcome });
-  } catch (error) {
-    classified = classifyAccountResult(account.fakeid, { ok: false, error });
-  }
+  // per-page 软 timeout（§2.7）：未设 timeoutMs 则原样传入 fetchPage（默认 OFF、零 withTimeout 包裹）。
+  const timeoutFetchPage =
+    ctx.timeoutMs === undefined ? deps.fetchPage : withTimeout(deps.fetchPage, ctx.clock, ctx.timeoutMs);
 
-  applyAccountOutcome(jobId, account.fakeid, classified.outcomeInput);
-  return classified.run;
+  const { outcomeInput, run } = await runWithRetry(
+    account.fakeid,
+    options,
+    timeoutFetchPage,
+    ctx.clock,
+    ctx.retry,
+    emitSignal
+  );
+
+  applyAccountOutcome(jobId, account.fakeid, outcomeInput); // 循环后只调一次（最终 outcome）
+  return run;
 }
 
 /**
- * C3-1 核心循环（顺序 async、无并发、无 sleep、无 cancel 检查）：startJob → 逐个 pending 账号
- * （priority DESC）processAccount → finalizeJob。等价于 runSyncJobPool 并发上限恒为 1 的特例，但保留
- * 独立实现以零改动锁定 C3-1 既有回归。失败隔离 / 系统故障传播语义见 processAccount。
+ * C3-1 核心循环（顺序 async、无并发、无 cancel 检查）：startJob → 逐个 pending 账号（priority DESC）
+ * processAccount → finalizeJob。等价于 runSyncJobPool 并发上限恒为 1 的特例，但保留独立实现以零改动锁定
+ * C3-1 既有回归。失败隔离 / 系统故障传播语义见 processAccount。
+ *
+ * C3-3：入口先 `resolveRetryContext(deps)` 校验/规范化 retry+timeout 配置——**严格前置于 startJob（首次
+ * DB 写 queued→running）**，非法即 fail-fast 抛 RangeError（零持久副作用，R1-B2·B4 验收）。顺序版无并发
+ * 控制器，emitSignal 为 no-op（默认 OFF 时行为与 C3-1 逐字等价）。
  */
 export async function runSyncJob(jobId: string, deps: RunSyncJobDeps): Promise<RunSyncJobResult> {
+  const ctx = resolveRetryContext(deps); // 校验/规范化前置于 startJob（零持久副作用）
   const job = startJob(jobId); // queued -> running（幂等）
   const pending = listJobAccounts(jobId, 'pending'); // 已按 priority DESC, fakeid 排序
   const accounts: AccountRunResult[] = [];
+  const emitSignal: (signal: ConcurrencySignal) => void = () => {}; // 顺序版无控制器 → no-op
 
   for (const account of pending) {
-    accounts.push(await processAccount(jobId, account, job, deps));
+    accounts.push(await processAccount(jobId, account, job, deps, ctx, emitSignal));
   }
 
   const finalJob = finalizeJob(jobId);
@@ -310,7 +350,11 @@ export class ConcurrencyController {
 
 /** runSyncJobPool 的并发观测（供测试断言 + C3-3 退避接线的观测缝）。 */
 export interface RunSyncJobPoolObservation {
-  /** 调度期间在飞 worker 峰值（= 在飞 fetchPage 峰值，每账号同一时刻最多一个在飞 fetchPage）。 */
+  /**
+   * 调度期间**逻辑账号 worker/admission** 并发峰值（= 同一时刻 processAccount 未 resolve 的账号数峰值）。
+   * **不等于真实在飞 fetchPage 峰值**（R1-B3/§2.6）：C3-3 软 timeout 下被放弃的底层 fetch 仍在后台跑，
+   * 若该账号退避后起下一 attempt，则同账号可能旧 fetch + 新 fetch 重叠，真实底层 fetch 峰值可高于本值。
+   */
   maxInFlight: number;
   /**
    * 每次启动一个 worker 时（admission 时刻）采样的 (limit, inFlight) 快照；每条满足 inFlight <= limit
@@ -331,9 +375,12 @@ export interface RunSyncJobPoolResult extends RunSyncJobResult {
  * processAccount（同一失败隔离 / 系统故障 / startBegin 语义），差异只在“同时处理多少账号”。
  *
  * 不变量：
- *   - 并发上限约束作用于 admission：仅当 inFlight < currentLimit() 时调度新账号（while 条件保证；每账号
- *     同一时刻最多一个在飞 fetchPage）。429 降档不会中断已在飞 worker，因此短期内 inFlight 可高于新档位；
- *     期间停止新增 admission，待既有 worker 排空后自然收敛至新档位。
+ *   - 并发上限约束作用于 admission：仅当 inFlight < currentLimit() 时调度新账号（while 条件保证；此处
+ *     inFlight 为**逻辑账号 worker/admission** 计数——每账号同一时刻最多一个逻辑 worker 在处理）。429 降档
+ *     不会中断已在飞 worker，因此短期内 inFlight 可高于新档位；期间停止新增 admission，待既有 worker 排空后
+ *     自然收敛至新档位。**注意（C3-3/§2.6）**：软 timeout 下被放弃的底层 fetch 仍在后台跑、可与该账号下一
+ *     attempt 的新 fetch 重叠，故真实在飞 fetchPage 峰值可高于逻辑 worker 峰值；若需硬约束真实网络并发须给
+ *     PageFetcher 加 AbortSignal（重新授权门 / C3-7），本切片不伪装完成。
  *   - 结果 accounts 严格按输入 pending 顺序（priority DESC, fakeid）按 index 落位，**与完成顺序无关**。
  *   - 账号业务失败被 processAccount 隔离为该账号失败终态，不影响其它并发账号。
  *   - 系统故障（processAccount 向上抛）：停止调度新账号 → 排空所有在飞 worker（不再新增 running）→ reject；
@@ -348,10 +395,14 @@ export async function runSyncJobPool(
   deps: RunSyncJobDeps,
   options: ConcurrencyControllerOptions = {}
 ): Promise<RunSyncJobPoolResult> {
+  const ctx = resolveRetryContext(deps); // C3-3：校验/规范化前置于 startJob（首次 DB 写），零持久副作用
   const job = startJob(jobId); // queued -> running（幂等）
   const pending = listJobAccounts(jobId, 'pending'); // 已按 priority DESC, fakeid 排序
   const accounts: AccountRunResult[] = new Array<AccountRunResult>(pending.length);
   const controller = new ConcurrencyController(options);
+  // C3-3/§2.5：升降档信号下沉为 per-attempt——runWithRetry 每 attempt 恰调一次 emitSignal；据此移除下方
+  // 完成回调里原“每账号一次 onResult”（原 :392），改由此闭包在每次 attempt 把信号转发给控制器。
+  const emitSignal: (signal: ConcurrencySignal) => void = (signal) => controller.onResult(signal);
 
   let nextIndex = 0;
   let inFlight = 0;
@@ -385,11 +436,11 @@ export async function runSyncJobPool(
           if (inFlight > maxInFlight) maxInFlight = inFlight;
           schedule.push({ limit: controller.currentLimit(), inFlight });
 
-          processAccount(jobId, account, job, deps).then(
+          processAccount(jobId, account, job, deps, ctx, emitSignal).then(
             (run) => {
               inFlight -= 1;
               accounts[index] = run;
-              controller.onResult(run.status === 'succeeded' ? 'succeeded' : run.errorKind);
+              // onResult 已在 runWithRetry 内 per-attempt 经 emitSignal 调用（§2.5）；此处不再重复。
               pump();
             },
             (err) => {
@@ -416,4 +467,271 @@ export async function runSyncJobPool(
 
   const finalJob = finalizeJob(jobId);
   return { job: finalJob, accounts, concurrency: { maxInFlight, schedule, finalLimit: controller.currentLimit() } };
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// C3-3 退避重试 + 抖动 + 注入时钟 + 可取消 per-page timeout（A 类·纯离线）
+//
+// 方案：docs/PLAN_WECHAT_EXPORTER_C3_3_BACKOFF_CLOCK.md（首审→R3 四审 Codex GO）。切片边界：
+//   - 账号级指数退避重试（在 processAccount 内、applyAccountOutcome 之前），由注入 RunnerClock 驱动 sleep、
+//     isRetryableErrorKind 驱动可重试性、可注入 jitter 决定抖动；引入 per-page **软** timeout（同签名装饰器）。
+//   - **软** timeout（§2.7）：判定超时 + 归类为可重试 timeout，**不主动中止在飞网络**（PageFetcher 无
+//     AbortSignal）。真正中止在飞请求 = 改生产 PageFetcher 契约 = 重新授权门 / C3-7。
+//   - 默认 OFF（retry 缺省 = maxAttempts:1、timeoutMs=undefined）时与 C3-1/C3-2 完全等价，锁既有回归。
+//   - 逻辑时钟（测试基建）不进生产模块，仅存于 smoke；生产只导出 RunnerClock / createRealClock。
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * sleep 被 abort 时的 reject 载体。**非 timeout**：withTimeout 的 timeout 分支只在 sleep fulfilled 时抛
+ * SyncFetchError('timeout')，sleep 被 abort → reject(ClockAbortError) 会跳过 then 的 onFulfilled，不误触发
+ * 超时分支（§2.1/§2.7）。
+ */
+export class ClockAbortError extends Error {
+  constructor(message = 'clock sleep aborted') {
+    super(message);
+    this.name = 'ClockAbortError';
+  }
+}
+
+/**
+ * 注入时钟：退避 sleep 与 per-page timeout 均经此。now() 预留给未来 deadline/观测（本切片轻用）；sleep 可
+ * 取消（传入 signal abort → reject(ClockAbortError)）。生产用 createRealClock；测试注入逻辑时钟零真实等待。
+ */
+export interface RunnerClock {
+  now(): number;
+  sleep(ms: number, opts?: { signal?: AbortSignal }): Promise<void>;
+}
+
+/** 退避重试策略（全部可选；入口 normalizeRetryOptions 填充默认 + 校验值域）。 */
+export interface RetryPolicyOptions {
+  /** 单账号最大尝试次数（含首次）。默认 1（不重试，锁回归）。必须为 >=1 的安全整数。 */
+  maxAttempts?: number;
+  /** 退避基数 ms。默认 1000。必须为有限非负数。 */
+  baseDelayMs?: number;
+  /** 退避封顶 ms。默认 30000。必须为有限非负数、>= baseDelayMs、<= 真实定时器上限 2_147_483_647。 */
+  maxDelayMs?: number;
+  /** 可注入抖动：raw → 实际 delay。默认 full jitter（random(0,raw)）；输出每次经 computeBackoffDelay fail-fast 校验。 */
+  jitter?: (rawDelayMs: number) => number;
+}
+
+/** normalizeRetryOptions 的输出：默认已填充、值域已校验。 */
+export interface NormalizedRetryOptions {
+  maxAttempts: number;
+  baseDelayMs: number;
+  maxDelayMs: number;
+  jitter: (rawDelayMs: number) => number;
+}
+
+/** processAccount 的运行时上下文（在 runner 入口一次性解析，校验前置于 startJob）。 */
+interface ResolvedRetryContext {
+  clock: RunnerClock;
+  retry: NormalizedRetryOptions;
+  timeoutMs: number | undefined;
+}
+
+const DEFAULT_BASE_DELAY_MS = 1000;
+const DEFAULT_MAX_DELAY_MS = 30_000;
+/** Node setTimeout 32-bit signed 上限；超过打 TimeoutOverflowWarning 并把 delay 退化为 1ms（本机 Node v25 只读探针已证）。 */
+const MAX_TIMER_MS = 2_147_483_647;
+
+/** 默认 full jitter：random(0, raw)。exporter 普通运行时 Math.random 合法（仅 Workflow 脚本禁用）。 */
+function fullJitter(raw: number): number {
+  return Math.random() * raw;
+}
+
+/**
+ * 生产真实时钟：now=Date.now；sleep=setTimeout。资源清理与单次结算是硬约束（防定时器泄漏 + 防双结算）：
+ *   - 预先 aborted（进入即 signal.aborted）：立即 reject(ClockAbortError)，**不注册 setTimeout、不加 listener**；
+ *   - 到期（resolve 路径）：removeEventListener 后 resolve；
+ *   - 中途 abort（reject 路径）：clearTimeout(timer) + removeEventListener 后 reject(ClockAbortError)；
+ *   - settled 布尔守卫保证 resolve/reject **只结算一次**、listener 只移除一次。
+ * （Date.now / setTimeout 在 exporter 普通 TS 运行时合法；Date.now 禁用只针对 Workflow 脚本。）
+ */
+export function createRealClock(): RunnerClock {
+  return {
+    now: () => Date.now(),
+    sleep: (ms, opts) =>
+      new Promise<void>((resolve, reject) => {
+        const signal = opts?.signal;
+        if (signal?.aborted) {
+          reject(new ClockAbortError());
+          return;
+        }
+        let settled = false;
+        const onAbort = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          signal?.removeEventListener('abort', onAbort);
+          reject(new ClockAbortError());
+        };
+        const timer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          signal?.removeEventListener('abort', onAbort);
+          resolve();
+        }, ms);
+        signal?.addEventListener('abort', onAbort);
+      }),
+  };
+}
+
+/**
+ * 入口配置校验 + 默认值填充。**必须在 startJob（首次 DB 写 queued→running）之前调用**：非法即 fail-fast 抛
+ * RangeError（零持久副作用，R1-B2·B4 验收）。与 ConcurrencyController 构造器的 RangeError fail-fast 风格一致。
+ */
+export function normalizeRetryOptions(retry?: RetryPolicyOptions): NormalizedRetryOptions {
+  const maxAttempts = retry?.maxAttempts ?? 1;
+  if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1) {
+    throw new RangeError(`retry.maxAttempts 必须为 >=1 的安全整数，收到 ${String(maxAttempts)}`);
+  }
+  const baseDelayMs = retry?.baseDelayMs ?? DEFAULT_BASE_DELAY_MS;
+  if (!Number.isFinite(baseDelayMs) || baseDelayMs < 0) {
+    throw new RangeError(`retry.baseDelayMs 必须为有限非负数，收到 ${String(baseDelayMs)}`);
+  }
+  const maxDelayMs = retry?.maxDelayMs ?? DEFAULT_MAX_DELAY_MS;
+  if (!Number.isFinite(maxDelayMs) || maxDelayMs < 0) {
+    throw new RangeError(`retry.maxDelayMs 必须为有限非负数，收到 ${String(maxDelayMs)}`);
+  }
+  if (baseDelayMs > maxDelayMs) {
+    throw new RangeError(`retry.baseDelayMs(${baseDelayMs}) 不得大于 maxDelayMs(${maxDelayMs})`);
+  }
+  if (maxDelayMs > MAX_TIMER_MS) {
+    throw new RangeError(`retry.maxDelayMs(${maxDelayMs}) 超过真实定时器上限 ${MAX_TIMER_MS}`);
+  }
+  const jitter = retry?.jitter;
+  if (jitter !== undefined && typeof jitter !== 'function') {
+    throw new RangeError('retry.jitter 必须为函数');
+  }
+  return { maxAttempts, baseDelayMs, maxDelayMs, jitter: jitter ?? fullJitter };
+}
+
+/** 校验 timeoutMs（若提供）：有限、严格正、<= 真实定时器上限。同样必须前置于 startJob。 */
+export function assertTimeoutMs(timeoutMs: number | undefined): void {
+  if (timeoutMs === undefined) return;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new RangeError(`timeoutMs 必须为有限正数，收到 ${String(timeoutMs)}`);
+  }
+  if (timeoutMs > MAX_TIMER_MS) {
+    throw new RangeError(`timeoutMs(${timeoutMs}) 超过真实定时器上限 ${MAX_TIMER_MS}`);
+  }
+}
+
+/** runner 入口一次性解析运行时上下文；**校验/规范化严格前置于 startJob**（零持久副作用）。 */
+function resolveRetryContext(deps: RunSyncJobDeps): ResolvedRetryContext {
+  const retry = normalizeRetryOptions(deps.retry);
+  assertTimeoutMs(deps.timeoutMs);
+  const clock = deps.clock ?? createRealClock();
+  return { clock, retry, timeoutMs: deps.timeoutMs };
+}
+
+/**
+ * 严格纯：raw 退避时延 = min(maxDelayMs, baseDelayMs * 2**min(attempt,30))。attempt 从 0 起。**无随机**、单调不减。
+ * 指数封顶 min(attempt,30) 是硬约束：防 attempt 大到 2**attempt=Infinity 时 base=0 触发 0*Infinity=NaN
+ * （cap=30 时 2**30≈1.07e9 恒有限 → base=0 时 raw 恒 0、base>0 时被 maxDelayMs 封顶）。
+ */
+export function computeRawBackoff(
+  attempt: number,
+  opts: { baseDelayMs?: number; maxDelayMs?: number } = {}
+): number {
+  const base = opts.baseDelayMs ?? DEFAULT_BASE_DELAY_MS;
+  const max = opts.maxDelayMs ?? DEFAULT_MAX_DELAY_MS;
+  return Math.min(max, base * 2 ** Math.min(attempt, 30));
+}
+
+/**
+ * raw 后过 jitter（默认 full jitter），并对 jitter 输出 **fail-fast 校验**：必须有限、>=0、<=raw；越界
+ * （负 / NaN / Infinity / >raw）抛 RangeError（**不静默 clamp**，避免坏 jitter 悄悄产出非法 sleep 时长）。
+ * 注意：full jitter 只保证 delay ∈ [0, raw]、**不保证单调**；单调只对 raw / identity-jitter 序列成立。
+ */
+export function computeBackoffDelay(attempt: number, opts: RetryPolicyOptions = {}): number {
+  const raw = computeRawBackoff(attempt, { baseDelayMs: opts.baseDelayMs, maxDelayMs: opts.maxDelayMs });
+  const delay = (opts.jitter ?? fullJitter)(raw);
+  if (!Number.isFinite(delay) || delay < 0 || delay > raw) {
+    throw new RangeError(`jitter 输出 ${String(delay)} 越界（要求有限且 ∈ [0, ${raw}]）`);
+  }
+  return delay;
+}
+
+/**
+ * per-page 软 timeout 装饰器（同签名 PageFetcher，不改 service / PageFetcher 契约）。§2.7 冻结结构（实施
+ * 不得偏离）：
+ *   ① fetchPage 调用包进 Promise.resolve().then(...)：捕获注入 fetcher 的**同步 throw**，保证 finally 一定
+ *      执行、定时器一定清理；
+ *   ② timeout scheduler 的 clock.sleep 调用**也**包进 Promise.resolve().then(...)（R2-C3-3-1 关闭点）：其
+ *      同步 throw 转成 timeoutP 的 rejection → Promise.race **一定被构造**、fetchP **一定进 race** 被内部
+ *      handler 消费 → 无孤儿 promise、无 unhandledRejection；
+ *   ③ timeout 只在 sleep **fulfilled**（真到点）时抛 SyncFetchError('timeout')；sleep 被 abort →
+ *      reject(ClockAbortError) 跳过 onFulfilled、不误触发 timeout；
+ *   ④ 外层 finally 无条件 ac.abort() → createRealClock.sleep clearTimeout（“可取消”）。
+ * 装饰器返回的任何 rejection 按 PageFetcher 契约 = 本页抓取失败，由 syncSingleAccount 的 catch 归类为受控
+ * 业务 outcome（§2.8 ②：正常到点=timeout 可重试；scheduler 异常无 timeout/network 特征=classifyFetchError
+ * 兜底 api_error 不可重试）——**非** runner fatal/drain。
+ */
+export function withTimeout(fetchPage: PageFetcher, clock: RunnerClock, timeoutMs: number): PageFetcher {
+  return (params) => {
+    const ac = new AbortController();
+    const fetchP = Promise.resolve().then(() => fetchPage(params));
+    const timeoutP = Promise.resolve()
+      .then(() => clock.sleep(timeoutMs, { signal: ac.signal }))
+      .then(() => {
+        throw new SyncFetchError('timeout', `withTimeout: 单页抓取超过 ${timeoutMs}ms`);
+      });
+    return Promise.race([fetchP, timeoutP]).finally(() => {
+      ac.abort();
+    });
+  };
+}
+
+/** runWithRetry 的返回：最终落库入参 + 观测摘要（run.attempts 已填充）。 */
+interface RunWithRetryResult {
+  outcomeInput: AccountOutcomeInput;
+  run: AccountRunResult;
+}
+
+/**
+ * 账号级退避重试循环（§2.4，B1 / R2-C3-3-1 关闭点）。每 attempt **窄 try/catch 只包 syncSingleAccount**：
+ * 返回 outcome 或抛错（通道 A SyncConfigError / service 防御性抛错）都翻成 RawAccountResult →
+ * classifyAccountResult 归类 → **恰 emit 一次**升降档信号（返回型 & 抛出型都 emit，关闭 B1 抛出型漏信号）。
+ *
+ * **退避 sleep（computeBackoffDelay + clock.sleep）在窄 catch 之外**（§2.4/§2.8 调用点①）：抛错 = 基础
+ * 设施/系统故障，原样出 runWithRetry → 顺序版 runSyncJob reject / 并发版 pool fatal-drain，**绝不**落成账号
+ * unexpected_error。注意：withTimeout 内的 timeout scheduler sleep（§2.8 调用点②）不在此列——它在
+ * syncSingleAccount 的 try 内，抛错走 service catch 的受控业务 outcome 路径。
+ *
+ * 终态判定：succeeded / auth_required（status!=='failed'）、不可重试、或已达 maxAttempts → 返回终态。
+ */
+async function runWithRetry(
+  fakeid: string,
+  options: SyncAccountOptions,
+  fetchPage: PageFetcher,
+  clock: RunnerClock,
+  retry: NormalizedRetryOptions,
+  emitSignal: (signal: ConcurrencySignal) => void
+): Promise<RunWithRetryResult> {
+  let attempt = 0;
+  for (;;) {
+    // ── 窄 try/catch：只包 syncSingleAccount；返回/抛出都翻成 RawAccountResult 交纯函数归类 ──
+    let raw: RawAccountResult;
+    try {
+      raw = { ok: true, outcome: await syncSingleAccount(options, fetchPage) };
+    } catch (error) {
+      raw = { ok: false, error };
+    }
+    const classified = classifyAccountResult(fakeid, raw);
+    const attempts = attempt + 1;
+    // 恰 emit 一次（返回型 & 抛出型都 emit；succeeded→'succeeded'，否则 errorKind[含 null]）。
+    emitSignal(classified.run.status === 'succeeded' ? 'succeeded' : classified.run.errorKind);
+
+    // ── 以下判定/退避在窄 catch 之外：抛错 = 系统故障，原样向上（不吞、进 fatal/drain）──
+    if (
+      classified.run.status !== 'failed' || // succeeded / auth_required → 终态
+      !classified.run.retryable || // 不可重试（含 config_error / api_error / 未预期）→ 终态
+      attempts >= retry.maxAttempts // 耗尽 → 终态
+    ) {
+      return { outcomeInput: classified.outcomeInput, run: { ...classified.run, attempts } };
+    }
+    await clock.sleep(computeBackoffDelay(attempt, retry)); // 退避（槽位保持，§2.6）；sleep/jitter 抛错向上传
+    attempt = attempts;
+  }
 }
