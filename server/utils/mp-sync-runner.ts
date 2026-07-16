@@ -156,15 +156,50 @@ export interface RunSyncJobResult {
 }
 
 /**
- * C3-1 核心循环：startJob → 逐个 pending 账号（priority DESC）解析 options → markRunning →
- * syncSingleAccount → classifyAccountResult → applyAccountOutcome → finalizeJob。顺序 async、无并发、
- * 无 sleep、无 cancel 检查。
+ * 单账号一次同步的完整处理单元：供顺序 runSyncJob 与并发 runSyncJobPool **共用同一语义源**
+ * （失败隔离 / 系统故障传播 / startBegin 固定，两条编排路径逐字一致，差异只在“同时跑几个账号”）。
  *
- * 失败隔离边界（F1/C3-1-F1）：try/catch **只**包住 syncSingleAccount，把它的抛错（通道 A 的
- * SyncConfigError / 防御性未预期错误）翻译成该账号失败终态，绝不中断整个 job 循环。
- * **resolveOptions 求值与 options 组装在 try 之外、且在 markAccountRunning 之前**——resolver / 依赖
- * 配置器抛错属系统故障，原样向上抛（runSyncJob reject），绝不伪装成账号业务失败、不迁移状态、不续跑。
+ * 边界（F1/C3-1-F1）：try/catch **只**包住 syncSingleAccount，把它的抛错（通道 A 的 SyncConfigError /
+ * 防御性未预期错误）翻译成该账号失败终态。**resolveOptions 求值 + options 组装在 try 之外、且在
+ * markAccountRunning 之前**——resolver / 依赖配置器抛错属系统故障，原样向上抛（顺序版使 runSyncJob
+ * reject；并发版由 runSyncJobPool 调度器捕获后停止调度、排空在飞再 reject），绝不伪装成账号业务失败、
+ * 不迁移状态、不续跑；置于 markAccountRunning 之前 → resolver 抛错时账号连状态迁移都不发生、保持 pending。
  * applyAccountOutcome / 状态机原语的抛错同属真实不变量违规，也在 catch 之外、故意不吞（向上抛）。
+ * startBegin 固定 0（F2/C3-1-F2）置于展开 overrides 之后作运行时第二层防御：C3-1/C3-2 不做断点续跑（C3-5）；
+ * 即便 resolver 经非类型安全输入返回 startBegin，也被此处 0 覆盖。
+ */
+async function processAccount(
+  jobId: string,
+  account: MpSyncJobAccount,
+  job: MpSyncJob,
+  deps: RunSyncJobDeps
+): Promise<AccountRunResult> {
+  const overrides = deps.resolveOptions?.(account, job);
+  const options: SyncAccountOptions = {
+    fakeid: account.fakeid,
+    sinceTime: account.sinceTime ?? job.requestedSince ?? 0,
+    ...overrides,
+    startBegin: 0,
+  };
+
+  markAccountRunning(jobId, account.fakeid); // pending -> running
+
+  let classified: ReturnType<typeof classifyAccountResult>;
+  try {
+    const outcome = await syncSingleAccount(options, deps.fetchPage);
+    classified = classifyAccountResult(account.fakeid, { ok: true, outcome });
+  } catch (error) {
+    classified = classifyAccountResult(account.fakeid, { ok: false, error });
+  }
+
+  applyAccountOutcome(jobId, account.fakeid, classified.outcomeInput);
+  return classified.run;
+}
+
+/**
+ * C3-1 核心循环（顺序 async、无并发、无 sleep、无 cancel 检查）：startJob → 逐个 pending 账号
+ * （priority DESC）processAccount → finalizeJob。等价于 runSyncJobPool 并发上限恒为 1 的特例，但保留
+ * 独立实现以零改动锁定 C3-1 既有回归。失败隔离 / 系统故障传播语义见 processAccount。
  */
 export async function runSyncJob(jobId: string, deps: RunSyncJobDeps): Promise<RunSyncJobResult> {
   const job = startJob(jobId); // queued -> running（幂等）
@@ -172,37 +207,213 @@ export async function runSyncJob(jobId: string, deps: RunSyncJobDeps): Promise<R
   const accounts: AccountRunResult[] = [];
 
   for (const account of pending) {
-    // F1（C3-1-F1）：resolveOptions 求值 + options 组装放在状态迁移与 try/catch **之外**。
-    // resolver / 依赖配置器抛错属系统故障（编程 / 依赖错误），不是远端账号业务失败：必须原样向上抛
-    // （runSyncJob 整体 reject），绝不被下方只为 syncSingleAccount 设的 catch 吞掉、伪装成该账号的
-    // failed/unexpected_error（那会污染持久错误事实与 retry 预算、让调用方无法感知系统性故障）。
-    // 置于 markAccountRunning 之前：resolver 抛错时该账号连状态迁移都不发生，保持 pending。
-    const overrides = deps.resolveOptions?.(account, job);
-    const options: SyncAccountOptions = {
-      fakeid: account.fakeid,
-      sinceTime: account.sinceTime ?? job.requestedSince ?? 0,
-      ...overrides,
-      // F2（C3-1-F2）：startBegin 固定 0 置于展开 overrides 之后 = 运行时第二层防御。C3-1 不做断点
-      // 续跑（C3-5）；即便 resolver 经非类型安全输入返回 startBegin，也被此处 0 覆盖。
-      startBegin: 0,
-    };
-
-    markAccountRunning(jobId, account.fakeid); // pending -> running
-
-    // 失败隔离边界**只**包住 syncSingleAccount：其抛错（通道 A 的 SyncConfigError / 防御性未预期错误）
-    // 翻译成该账号失败终态，不中断整 job。applyAccountOutcome / 状态机原语的抛错属真实不变量违规，故意不吞。
-    let classified: ReturnType<typeof classifyAccountResult>;
-    try {
-      const outcome = await syncSingleAccount(options, deps.fetchPage);
-      classified = classifyAccountResult(account.fakeid, { ok: true, outcome });
-    } catch (error) {
-      classified = classifyAccountResult(account.fakeid, { ok: false, error });
-    }
-
-    applyAccountOutcome(jobId, account.fakeid, classified.outcomeInput);
-    accounts.push(classified.run);
+    accounts.push(await processAccount(jobId, account, job, deps));
   }
 
   const finalJob = finalizeJob(jobId);
   return { job: finalJob, accounts };
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// C3-2 并发池 + 自适应档位（A 类·纯离线：注入 PageFetcher + 临时 SQLite，可离线全验）
+//
+// **切片边界（PLAN §一/§二 C3-2，2026-07-15 用户拍板选项 1）**：本切片只做“账号级并发调度 +
+// 自适应并发档位”。**不实现主动超时中断 / AbortSignal / 退避 sleep（C3-3）、协作式 cancel（C3-4）**。
+// timeout 仅作为**已完成账号 outcome 的降档信号**，不在此主动中断慢请求；协作式 cancel 及账号
+// cancelled 落定（需持久层新增 mutator）归 C3-4。避免把“未实现”误判为漏测。
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** C3-2 并发档位表（PLAN §三决策 1：固定档位表，简单 / 可测 / 可解释；非连续 AIMD）。 */
+export const DEFAULT_CONCURRENCY_LEVELS = [1, 2, 4, 6, 8] as const;
+/** 起始档位下标（值 4）。 */
+export const DEFAULT_START_LEVEL_INDEX = 2;
+/** 连续成功多少次升一档。 */
+export const DEFAULT_HEALTHY_STREAK_TO_RAISE = 4;
+
+export interface ConcurrencyControllerOptions {
+  /** 并发档位表，必须为严格递增的安全正整数序列。默认 [1,2,4,6,8]。 */
+  levels?: readonly number[];
+  /** 起始档位下标（clamp 到合法范围）。默认 2（值 4）。 */
+  startIndex?: number;
+  /** 连续成功多少次升一档。默认 4。 */
+  healthyStreakToRaise?: number;
+}
+
+/** onResult 的输入信号：'succeeded' 或失败账号的 errorKind（null = 未知来源失败）。 */
+export type ConcurrencySignal = 'succeeded' | SyncErrorKind | null;
+
+/**
+ * C3-2 自适应并发档位控制器（纯逻辑，离线可单测）。**只决定“允许多少账号并发”，不做任何 sleep /
+ * 退避时序**（退避是 C3-3）。升降规则消费已完成账号 outcome 的信号（PLAN §一 C3-2）：
+ *   - succeeded：连续成功计数 +1；达 healthyStreakToRaise 且未到顶档 → 升一档、计数清零（健康升档）。
+ *   - rate_limited / timeout / auth_required：**立即降到最低档**（levels[0]），连续成功计数清零
+ *     （保守：遇限流 / 超时 / 需重登，最小化在飞压力）。
+ *   - 其它失败（config_error / api_error / network / 未知）：中断连续成功（计数清零），但**不升不降**
+ *     （确定性 / 账号级问题不代表服务端限流，不应据此收缩全局并发）。
+ *
+ * JS 单线程 event loop 内 onResult 只在各 worker 完成回调中串行调用、currentLimit 只在调度器同步 pump
+ * 时读取，无并发竞态。
+ */
+export class ConcurrencyController {
+  private readonly levels: readonly number[];
+  private readonly healthyStreakToRaise: number;
+  private index: number;
+  private healthyStreak = 0;
+
+  constructor(options: ConcurrencyControllerOptions = {}) {
+    const levels = options.levels ?? DEFAULT_CONCURRENCY_LEVELS;
+    if (levels.length === 0) throw new RangeError('ConcurrencyController: levels 不能为空');
+    if (!levels.every((n) => Number.isSafeInteger(n) && n > 0)) {
+      throw new RangeError('ConcurrencyController: levels 必须均为安全正整数');
+    }
+    for (let i = 1; i < levels.length; i += 1) {
+      if (levels[i] <= levels[i - 1]) throw new RangeError('ConcurrencyController: levels 必须严格递增');
+    }
+    const raise = options.healthyStreakToRaise ?? DEFAULT_HEALTHY_STREAK_TO_RAISE;
+    if (!Number.isSafeInteger(raise) || raise <= 0) {
+      throw new RangeError('ConcurrencyController: healthyStreakToRaise 必须为安全正整数');
+    }
+    const startIndex = options.startIndex ?? DEFAULT_START_LEVEL_INDEX;
+    this.levels = levels;
+    this.healthyStreakToRaise = raise;
+    this.index = Math.min(Math.max(0, Number.isSafeInteger(startIndex) ? startIndex : 0), levels.length - 1);
+  }
+
+  /** 当前并发上限。 */
+  currentLimit(): number {
+    return this.levels[this.index];
+  }
+
+  /** 当前档位下标（观测 / 测试用）。 */
+  currentIndex(): number {
+    return this.index;
+  }
+
+  /** 消费一个账号的完成信号，按规则升 / 降 / 保持档位。 */
+  onResult(signal: ConcurrencySignal): void {
+    if (signal === 'succeeded') {
+      this.healthyStreak += 1;
+      if (this.healthyStreak >= this.healthyStreakToRaise && this.index < this.levels.length - 1) {
+        this.index += 1;
+        this.healthyStreak = 0;
+      }
+      return;
+    }
+    // 失败信号一律中断健康连续。
+    this.healthyStreak = 0;
+    if (signal === 'rate_limited' || signal === 'timeout' || signal === 'auth_required') {
+      this.index = 0; // 降到最低档
+    }
+    // 其它失败（config_error / api_error / network / 未知）：不改档位。
+  }
+}
+
+/** runSyncJobPool 的并发观测（供测试断言 + C3-3 退避接线的观测缝）。 */
+export interface RunSyncJobPoolObservation {
+  /** 调度期间在飞 worker 峰值（= 在飞 fetchPage 峰值，每账号同一时刻最多一个在飞 fetchPage）。 */
+  maxInFlight: number;
+  /**
+   * 每次启动一个 worker 时（admission 时刻）采样的 (limit, inFlight) 快照；每条满足 inFlight <= limit
+   * （admission 门 inFlight < currentLimit 保证）。注意这是 **admission 时刻**采样、非任意时刻：429 降档后
+   * 旧 worker 排空期间可能短暂 inFlight > currentLimit()，期间不再新增 admission，故不会写入违反项。
+   */
+  schedule: Array<{ limit: number; inFlight: number }>;
+  /** 结束时的并发档位。 */
+  finalLimit: number;
+}
+
+export interface RunSyncJobPoolResult extends RunSyncJobResult {
+  concurrency: RunSyncJobPoolObservation;
+}
+
+/**
+ * C3-2 并发池 runner：在 C3-1 顺序编排之上做**账号级并发调度 + 自适应档位**，与 runSyncJob 共用
+ * processAccount（同一失败隔离 / 系统故障 / startBegin 语义），差异只在“同时处理多少账号”。
+ *
+ * 不变量：
+ *   - 并发上限约束作用于 admission：仅当 inFlight < currentLimit() 时调度新账号（while 条件保证；每账号
+ *     同一时刻最多一个在飞 fetchPage）。429 降档不会中断已在飞 worker，因此短期内 inFlight 可高于新档位；
+ *     期间停止新增 admission，待既有 worker 排空后自然收敛至新档位。
+ *   - 结果 accounts 严格按输入 pending 顺序（priority DESC, fakeid）按 index 落位，**与完成顺序无关**。
+ *   - 账号业务失败被 processAccount 隔离为该账号失败终态，不影响其它并发账号。
+ *   - 系统故障（processAccount 向上抛）：停止调度新账号 → 排空所有在飞 worker（不再新增 running）→ reject；
+ *     已在飞账号各自落终态（不悬挂），未调度账号保持 pending，job 不 finalize（保持 running，交 C3-5 恢复）。
+ *   - 全部账号处理完 → finalizeJob（与 runSyncJob 同）。
+ *
+ * 并发安全：node:sqlite 为同步 API，markAccountRunning / applyAccountOutcome 全同步执行、无 await 切换点，
+ * 单线程 event loop 下多 worker 的 DB 写天然串行、事务不交错；唯一异步切换在 await fetchPage（不碰 DB）。
+ */
+export async function runSyncJobPool(
+  jobId: string,
+  deps: RunSyncJobDeps,
+  options: ConcurrencyControllerOptions = {}
+): Promise<RunSyncJobPoolResult> {
+  const job = startJob(jobId); // queued -> running（幂等）
+  const pending = listJobAccounts(jobId, 'pending'); // 已按 priority DESC, fakeid 排序
+  const accounts: AccountRunResult[] = new Array<AccountRunResult>(pending.length);
+  const controller = new ConcurrencyController(options);
+
+  let nextIndex = 0;
+  let inFlight = 0;
+  let maxInFlight = 0;
+  // 系统故障哨兵：hasFatalError 独立表达“是否已发生系统故障”，与 fatalError 的**取值**彻底解耦。
+  // Promise 可合法以 null 拒绝（resolver throw null / reject(null)），故绝不能用 `fatalError === null`
+  // 兼表“尚无故障”——否则 null rejection 会被误判为“未故障”：调度门继续开、排空后 resolve、finalize 成
+  // 业务 partial，把系统/依赖故障伪装成业务部分失败，调用方进不了 C3-5 恢复路径。fatalError 只承载
+  // “原样待抛的值”（含 null / undefined），是否故障一律看 hasFatalError。
+  let hasFatalError = false;
+  let fatalError: unknown = undefined;
+  let settled = false;
+  const schedule: Array<{ limit: number; inFlight: number }> = [];
+
+  await new Promise<void>((resolve, reject) => {
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      if (hasFatalError) reject(fatalError);
+      else resolve();
+    };
+
+    const pump = () => {
+      // 系统故障后不再调度新账号；等在飞排空后原样 reject（不新增 running，已在飞的各自落终态）。
+      if (!hasFatalError) {
+        while (nextIndex < pending.length && inFlight < controller.currentLimit()) {
+          const index = nextIndex;
+          nextIndex += 1;
+          const account = pending[index];
+          inFlight += 1;
+          if (inFlight > maxInFlight) maxInFlight = inFlight;
+          schedule.push({ limit: controller.currentLimit(), inFlight });
+
+          processAccount(jobId, account, job, deps).then(
+            (run) => {
+              inFlight -= 1;
+              accounts[index] = run;
+              controller.onResult(run.status === 'succeeded' ? 'succeeded' : run.errorKind);
+              pump();
+            },
+            (err) => {
+              inFlight -= 1;
+              // 记录首个系统故障；err 原样保留（含 null）待 settle 时透传，绝不据其取值判断是否故障。
+              if (!hasFatalError) {
+                hasFatalError = true;
+                fatalError = err;
+              }
+              pump();
+            }
+          );
+        }
+      }
+
+      // 终止：无在飞且（账号处理完 或 已遇系统故障）。
+      if (inFlight === 0 && (hasFatalError || nextIndex >= pending.length)) {
+        settle();
+      }
+    };
+
+    pump();
+  });
+
+  const finalJob = finalizeJob(jobId);
+  return { job: finalJob, accounts, concurrency: { maxInFlight, schedule, finalLimit: controller.currentLimit() } };
 }
