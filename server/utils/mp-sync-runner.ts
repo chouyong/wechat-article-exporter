@@ -16,6 +16,8 @@ import {
   markAccountRunning,
   applyAccountOutcome,
   finalizeJob,
+  cancelPendingAccounts,
+  isCancelRequested,
   type MpSyncJob,
   type MpSyncJobAccount,
   type AccountOutcomeInput,
@@ -167,6 +169,14 @@ export interface RunSyncJobDeps {
    * AbortSignal；真实中止 = 改生产契约 = 重新授权门 / C3-7）。入口 `assertTimeoutMs` 校验。
    */
   timeoutMs?: number;
+  /**
+   * C3-4：协作式 cancel probe。默认 registry 的 `isCancelRequested`（读 `cancel_requested_at`）。仅测试注入
+   * 替身以确定性构造 cancel 时序；生产不传、恒用默认实现。DI 风格对齐既有 `clock`。
+   * **不变量注意**：`cancelRequested=true ⟹ cancel_requested_at 非空` 仅对生产默认 probe 成立；测试注入替身
+   * 若走 cancel-resolve 路径（触达 `cancelPendingAccounts`），**必须先真实 `requestCancel`** 建同一真库标记，
+   * 否则被 `cancelPendingAccounts` 的 P3 前置拦截（见 runSyncJobPool §④ 收口 + smoke G9a fixture 不变量）。
+   */
+  isCancelRequested?: (jobId: string) => boolean;
 }
 
 export interface RunSyncJobResult {
@@ -245,13 +255,23 @@ export async function runSyncJob(jobId: string, deps: RunSyncJobDeps): Promise<R
   const pending = listJobAccounts(jobId, 'pending'); // 已按 priority DESC, fakeid 排序
   const accounts: AccountRunResult[] = [];
   const emitSignal: (signal: ConcurrencySignal) => void = () => {}; // 顺序版无控制器 → no-op
+  // C3-4：协作 cancel probe。默认 registry isCancelRequested（生产恒用）；测试可注入替身。
+  const probe = deps.isCancelRequested ?? isCancelRequested;
 
   for (const account of pending) {
+    // 账号间隙检查（当前账号已自然跑完）：cancel 到达 → 停止处理后续账号。检查置于每账号处理**之前**：
+    // cancel 在 account[k] 处理期间到达 → account[k] 自然落终态 → 下一轮 break → account[k+1..] 仍 pending。
+    // probe 抛错 = 系统故障：在 async 函数体内同步调用、自然沿 runSyncJob 向上传出 → 返回 Promise reject
+    // → 不执行后续 cancelPendingAccounts/finalize、job 保持 running 交 C3-5（与并发版 fatal 语义一致，无需 try/catch）。
+    if (probe(jobId)) break;
     accounts.push(await processAccount(jobId, account, job, deps, ctx, emitSignal));
   }
 
-  const finalJob = finalizeJob(jobId);
-  return { job: finalJob, accounts };
+  // cancel 已到达（含循环 break 提前退出、或最后一个账号完成后 cancel 到达）→ 剩余 pending 落 cancelled。
+  // P3 门：probe 为默认实现时 cancel_requested_at 已非空；无剩余 pending 时 cancelPendingAccounts 返回 0（F-C2-2）。
+  if (probe(jobId)) cancelPendingAccounts(jobId);
+  const finalJob = finalizeJob(jobId); // cancelRequestedAt 非空 → cancelled
+  return { job: finalJob, accounts }; // push 累积，天然无空洞（P1 不涉及顺序版）
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -398,7 +418,8 @@ export async function runSyncJobPool(
   const ctx = resolveRetryContext(deps); // C3-3：校验/规范化前置于 startJob（首次 DB 写），零持久副作用
   const job = startJob(jobId); // queued -> running（幂等）
   const pending = listJobAccounts(jobId, 'pending'); // 已按 priority DESC, fakeid 排序
-  const accounts: AccountRunResult[] = new Array<AccountRunResult>(pending.length);
+  // C3-4/§①：缓冲改稀疏可空类型——cancel 路径未 admit 的槽位保持 undefined，resolve 后 filter 压实（§④/P1）。
+  const accounts: (AccountRunResult | undefined)[] = new Array<AccountRunResult | undefined>(pending.length);
   const controller = new ConcurrencyController(options);
   // C3-3/§2.5：升降档信号下沉为 per-attempt——runWithRetry 每 attempt 恰调一次 emitSignal；据此移除下方
   // 完成回调里原“每账号一次 onResult”（原 :392），改由此闭包在每次 attempt 把信号转发给控制器。
@@ -415,6 +436,11 @@ export async function runSyncJobPool(
   let hasFatalError = false;
   let fatalError: unknown = undefined;
   let settled = false;
+  // C3-4/§②：协作 cancel 哨兵 + probe。cancelRequested 与 hasFatalError **解耦**（cancel-only 走 resolve、
+  // fatal 走 reject，二者同发 fatal 严格优先，见 settle）。probe 默认 registry isCancelRequested（生产恒用），
+  // 可注入替身（仅测试）。
+  let cancelRequested = false;
+  const probe = deps.isCancelRequested ?? isCancelRequested;
   const schedule: Array<{ limit: number; inFlight: number }> = [];
 
   await new Promise<void>((resolve, reject) => {
@@ -426,8 +452,23 @@ export async function runSyncJobPool(
     };
 
     const pump = () => {
-      // 系统故障后不再调度新账号；等在飞排空后原样 reject（不新增 running，已在飞的各自落终态）。
-      if (!hasFatalError) {
+      // C3-4/§②：协作 cancel probe——抛错=系统故障，复用 fatal sentinel（P2）。probe 只在未 fatal 且未 cancel
+      // 时调用：一旦 cancel 置位或已 fatal 就不再探询（省重复 SELECT、也避免重复抛点）。
+      if (!hasFatalError && !cancelRequested) {
+        try {
+          if (probe(jobId)) cancelRequested = true;
+        } catch (err) {
+          // probe 抛错 = 系统故障（DB 异常）→ 归 hasFatalError（**不是** cancelRequested）；err 原样保留（含 null）
+          // 待 settle 时透传。这样后续 pump 走 fatal-drain-reject（不 finalize、job 保持 running 交 C3-5），
+          // 精确关闭 P2：回调内 probe 抛错不再让外层手写 Promise 永挂。
+          if (!hasFatalError) {
+            hasFatalError = true;
+            fatalError = err;
+          }
+        }
+      }
+      // 系统故障或已请求取消后都不再调度新账号；等在飞排空后 settle（fatal→reject / cancel-only→resolve）。
+      if (!hasFatalError && !cancelRequested) {
         while (nextIndex < pending.length && inFlight < controller.currentLimit()) {
           const index = nextIndex;
           nextIndex += 1;
@@ -456,8 +497,8 @@ export async function runSyncJobPool(
         }
       }
 
-      // 终止：无在飞且（账号处理完 或 已遇系统故障）。
-      if (inFlight === 0 && (hasFatalError || nextIndex >= pending.length)) {
+      // 终止：无在飞且（账号处理完 或 已遇系统故障 或 已请求取消）。
+      if (inFlight === 0 && (hasFatalError || cancelRequested || nextIndex >= pending.length)) {
         settle();
       }
     };
@@ -465,8 +506,21 @@ export async function runSyncJobPool(
     pump();
   });
 
-  const finalJob = finalizeJob(jobId);
-  return { job: finalJob, accounts, concurrency: { maxInFlight, schedule, finalLimit: controller.currentLimit() } };
+  // ── C3-4/§④：resolve 后（await 正常返回，即**非 fatal** 路径）收口 cancel + 压实（P1）。fatal 路径 reject
+  // 从不到达此处。cancelRequested 时把未 admit 的 pending → cancelled（P3 门：生产默认 probe 下
+  // cancelRequested ⟹ cancel_requested_at 非空；测试须先真实 requestCancel 建同一真库标记，见 smoke G9a
+  // fixture 不变量）。
+  if (cancelRequested) cancelPendingAccounts(jobId);
+  const finalJob = finalizeJob(jobId); // cancelRequestedAt 非空 → cancelled；否则按四态收口
+  // P1：压实稀疏缓冲为纯 AccountRunResult[]（无空洞、保持 pending 相对顺序）。非 cancel 非 fatal 路径所有槽位
+  // 填满 → filter 为 no-op（同序同内容，锁 236 回归）；cancel 路径未 admit 槽位为空洞 → 被剔除 → accounts 只含
+  // 本次实际完成的账号、按 pending 相对顺序压实、JSON.stringify 不产 null、类型收窄回 AccountRunResult[]。
+  const compact = accounts.filter((r): r is AccountRunResult => r !== undefined);
+  return {
+    job: finalJob,
+    accounts: compact,
+    concurrency: { maxInFlight, schedule, finalLimit: controller.currentLimit() },
+  };
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

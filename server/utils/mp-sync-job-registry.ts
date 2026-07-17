@@ -429,6 +429,71 @@ export function requestCancel(id: string): MpSyncJob {
 }
 
 /**
+ * C3-4 轻量探询：该 job 是否已请求取消（读 cancel_requested_at，非空即 true）。
+ * 是 runner 协作 cancel 的**默认 probe 实现**（runner 可经 RunSyncJobDeps 注入替身，仅测试用；生产恒用本函数）。
+ * 不存在的 job 返回 false（防御、不抛；runner 已持有合法 jobId）。只 SELECT 单列，避免每账号读整行。
+ * 注意：这是在默认 OFF 路径也会执行的 SQLite 读，**可能抛错**（DB 层异常）——顺序版靠自然向上传出、
+ * 并发版靠 pump 顶 try/catch 归 fatal 收口（见 mp-sync-runner.ts runSyncJob/runSyncJobPool）。
+ */
+export function isCancelRequested(jobId: string): boolean {
+  const db = getMpSyncDatabase();
+  const row = db.prepare('SELECT cancel_requested_at FROM mp_sync_jobs WHERE id = ?').get(jobId) as
+    | SqliteRow
+    | undefined;
+  return !!row && row.cancel_requested_at !== null;
+}
+
+/**
+ * C3-4 协作式取消收口：把该 job 的 pending 账号批量落为 cancelled，返回被改的账号数。
+ * runner 在停止调度新账号后调用（见 mp-sync-runner.ts runSyncJob/runSyncJobPool）。沿用
+ * resetFailedAccounts/finalizeJob 的 BEGIN IMMEDIATE 事务范式。
+ *
+ * **两道硬门，缺一 fail-closed 全回滚、账号与聚合逐字段不变**：
+ *   1. **job cancel 标记前置（P3 单一事实源）**：同一事务内 selectJob 读该 job，job 不存在或
+ *      cancel_requested_at IS NULL → 抛错 → ROLLBACK → 零账号变化、聚合不变。杜绝“账号已 cancelled、
+ *      job 从未请求取消”的跨聚合不一致；校验与 UPDATE 在同一 BEGIN IMMEDIATE 内，无 TOCTOU 缝隙。
+ *      取消受理的唯一真相仍是 requestCancel（canTransitionJob 驱动），本函数只服从、不另立更宽的门。
+ *   2. **WHERE status='pending' 源状态硬门**：只碰 pending 源（pending->cancelled 合法），**绝不**触及
+ *      running / succeeded / failed / auth_required / interrupted / 既有 cancelled（已完成/在飞/待恢复/已取消
+ *      账号事实不被改）。
+ *
+ * 聚合：cancelled 既不计 succeeded 也不计 failed，故 recomputeJobAggregates 对计数是 no-op；仍调用以保持
+ * 事务一致 + 未来聚合口径变化时不失真。幂等：requestCancel 后重复调 → 第二次已无 pending → changes=0、
+ * 无副作用（仍过 P3 门，cancel_requested_at 仍非空）。
+ */
+export function cancelPendingAccounts(jobId: string): number {
+  const db = getMpSyncDatabase();
+  const now = nowIso();
+  let count = 0;
+  db.exec('BEGIN IMMEDIATE;');
+  try {
+    // ── P3 单一事实源硬门（fail-closed）：job 必须存在且已 requestCancel ──
+    const job = selectJob(db, jobId);
+    if (!job) throw new Error(`mp_sync_job not found: ${jobId}`);
+    if (!job.cancelRequestedAt) {
+      throw new Error(
+        `cancelPendingAccounts requires prior requestCancel (cancel_requested_at is null): ${jobId}`
+      );
+    }
+    // ── pending->cancelled 批量；WHERE status='pending' 硬门只碰 pending 源 ──
+    const result = db
+      .prepare(
+        `UPDATE mp_sync_job_accounts
+         SET status = 'cancelled', finished_at = COALESCE(finished_at, ?), updated_at = ?
+         WHERE job_id = ? AND status = 'pending'`
+      )
+      .run(now, now, jobId);
+    count = Number(result.changes ?? 0);
+    recomputeJobAggregates(db, jobId);
+    db.exec('COMMIT;');
+  } catch (error) {
+    db.exec('ROLLBACK;');
+    throw error;
+  }
+  return count;
+}
+
+/**
  * 计算并落定任务终态：
  * - 已请求取消 -> cancelled
  * - 全部成功（total>0）-> completed

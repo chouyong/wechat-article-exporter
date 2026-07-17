@@ -1393,6 +1393,211 @@ try {
 
   check('F12. 全程无残留 unhandledRejection（正确实现下 c33Unhandled 为空）', c33Unhandled.length === 0);
 
+  // ══════════════════════════════════════════════════════════════════════════
+  // G 段（C3-4 协作式 cancel）：runSyncJob 账号间隙 cancel + runSyncJobPool admission cancel
+  //   + P1 稀疏压实 + P2 probe 抛错不永挂 + fatal 严格优先 + cancel-only resolve。
+  //   标签用 G 以避免与既有 C3-3 F1-F12 冲突；每条显式标注对应方案 §3.2 项号。
+  //   fixture 不变量（方案 §R3）：凡 probe 返回 true（走 cancel-resolve → cancelPendingAccounts）的 fixture
+  //   必须先真实 requestCancel（DB cancel_requested_at 非空），仅 probe 抛错的 G8（P2 路径、走 fatal→reject、
+  //   从不到达 cancelPendingAccounts）除外——否则被 cancelPendingAccounts 的 P3 前置拦截而误红。
+  // ══════════════════════════════════════════════════════════════════════════
+
+  // G1（§3.2 顺序(1)）：cancel 在开跑前 → 全 pending cancelled、job cancelled、0 次 fetch。
+  {
+    const ids = ['g1-0', 'g1-1', 'g1-2'];
+    createSyncJob({ id: 'job-g1', requestedSince: 1000, accounts: ids.map((f, i) => ({ fakeid: f, priority: 10 - i })) });
+    jobs.requestCancel('job-g1'); // 真实取消标记（fixture 不变量）
+    const { fetchPage, calls } = makeRoutingFetcher({});
+    const res = await runSyncJob('job-g1', { fetchPage, isCancelRequested: (jid) => jobs.isCancelRequested(jid) });
+    check('G1. cancel 开跑前 → 全 pending → cancelled', ids.every((f) => getJobAccount('job-g1', f).status === 'cancelled'));
+    check('G1. job=cancelled', res.job.status === 'cancelled');
+    check('G1. 0 次 fetch（未处理任何账号）', Object.keys(calls).length === 0);
+    check('G1. accounts=[]（顺序版无账号处理）', res.accounts.length === 0);
+  }
+
+  // G2（§3.2 顺序(2)）：cancel 在第 1 账号后到达 → 前 1 保留自然终态、其后 pending → cancelled、fetcher 只被前 1 调。
+  {
+    const ids = ['g2-0', 'g2-1', 'g2-2']; // priority DESC
+    createSyncJob({ id: 'job-g2', requestedSince: 1000, accounts: ids.map((f, i) => ({ fakeid: f, priority: 10 - i })) });
+    const { fetchPage, calls } = makeRoutingFetcher({
+      'g2-0': () => ({ articles: [article('a', 2000)], hasMore: false }),
+      'g2-1': () => ({ articles: [article('b', 2000)], hasMore: false }),
+      'g2-2': () => ({ articles: [article('c', 2000)], hasMore: false }),
+    });
+    // probe 委托真实 registry；在第 1 账号处理后、第 2 账号前触发真实 requestCancel（模拟 cancel 在 account[0] 期间到达）。
+    let probeCalls = 0;
+    const probe = (jid) => {
+      probeCalls += 1;
+      if (probeCalls === 2) jobs.requestCancel(jid);
+      return jobs.isCancelRequested(jid);
+    };
+    const res = await runSyncJob('job-g2', { fetchPage, isCancelRequested: probe });
+    check('G2. 前 1 账号自然完成 succeeded', getJobAccount('job-g2', 'g2-0').status === 'succeeded');
+    check('G2. 其后 pending → cancelled', getJobAccount('job-g2', 'g2-1').status === 'cancelled' && getJobAccount('job-g2', 'g2-2').status === 'cancelled');
+    check('G2. job=cancelled', res.job.status === 'cancelled');
+    check('G2. fetcher 只被前 1 账号调（g2-0=1、其余 0）', calls['g2-0'] === 1 && (calls['g2-1'] ?? 0) === 0 && (calls['g2-2'] ?? 0) === 0);
+    check('G2. accounts 只含实际完成的 g2-0', res.accounts.length === 1 && res.accounts[0].fakeid === 'g2-0');
+  }
+
+  // G3（§3.2 顺序(3)）：cancel 在全部完成后到达 → job cancelled、pending=0、已完成事实不变（F-C2-2）。
+  {
+    const ids = ['g3-0', 'g3-1'];
+    createSyncJob({ id: 'job-g3', requestedSince: 1000, accounts: ids.map((f, i) => ({ fakeid: f, priority: 10 - i })) });
+    const { fetchPage } = makeRoutingFetcher({
+      'g3-0': () => ({ articles: [article('a', 2000)], hasMore: false }),
+      'g3-1': () => ({ articles: [article('b', 2000)], hasMore: false }),
+    });
+    let probeCalls = 0;
+    const probe = (jid) => {
+      probeCalls += 1;
+      if (probeCalls === 3) jobs.requestCancel(jid); // 循环内 2 次（各返 false）+ 循环后第 3 次触发 cancel
+      return jobs.isCancelRequested(jid);
+    };
+    const res = await runSyncJob('job-g3', { fetchPage, isCancelRequested: probe });
+    check('G3. cancel 在全部完成后到达 → job=cancelled（F-C2-2）', res.job.status === 'cancelled');
+    check('G3. 已完成账号事实不变（均 succeeded）', ids.every((f) => getJobAccount('job-g3', f).status === 'succeeded'));
+    check('G3. 无剩余 pending（cancelPendingAccounts 返回 0）', jobs.listJobAccounts('job-g3', 'pending').length === 0);
+    check('G3. accounts 含全部 2 个完成账号', res.accounts.length === 2);
+  }
+
+  // G4（§3.2 顺序(4)）：默认无 cancel → 与 C3-3 行为等价（fix-must-fail j：isCancelRequested 恒 true 则此处漂移）。
+  {
+    const ids = ['g4-0', 'g4-1'];
+    createSyncJob({ id: 'job-g4', requestedSince: 1000, accounts: ids.map((f, i) => ({ fakeid: f, priority: 10 - i })) });
+    const { fetchPage } = makeRoutingFetcher({
+      'g4-0': () => ({ articles: [article('a', 2000)], hasMore: false }),
+      'g4-1': () => ({ articles: [article('b', 2000)], hasMore: false }),
+    });
+    const res = await runSyncJob('job-g4', { fetchPage }); // 无注入 probe、无 requestCancel → 默认 OFF（走默认 registry probe）
+    check('G4. 默认 OFF：全 succeeded、job=completed（与 C3-3 等价）', res.job.status === 'completed' && res.accounts.every((a) => a.status === 'succeeded'));
+    check('G4. 默认 OFF：无账号被 cancelled', ids.every((f) => getJobAccount('job-g4', f).status === 'succeeded'));
+  }
+
+  // G5/G6/G7b（§3.2 并发(5)+(6) admission口径+(7b) 稀疏压实）：并发 mid-flight cancel。
+  {
+    const ids = ['g5-0', 'g5-1', 'g5-2', 'g5-3', 'g5-4', 'g5-5'];
+    createSyncJob({ id: 'job-g5', requestedSince: 1000, accounts: ids.map((f, i) => ({ fakeid: f, priority: 10 - i })) });
+    // limit 固定 2（levels:[2]）；首批 admit g5-0/g5-1。g5-0 先完成（delay 10）并在 handler 内真实 requestCancel，
+    // 后续 pump 观察 cancel → 停止 admission；g5-1 自然 drain（delay 30）；g5-2..5 从未 admit → cancelPendingAccounts。
+    const fc = makeConcurrentFetcher({
+      'g5-0': { delayMs: 10, handler: () => { jobs.requestCancel('job-g5'); return { articles: [article('c0', 2000)], hasMore: false }; } },
+    }, 30);
+    const res = await runSyncJobPool('job-g5',
+      { fetchPage: fc.fetchPage, isCancelRequested: (jid) => jobs.isCancelRequested(jid) },
+      { levels: [2], startIndex: 0, healthyStreakToRaise: 100000 });
+    // (5) drain + 剩余 pending → cancelled + job cancelled
+    check('G5. job=cancelled', res.job.status === 'cancelled');
+    check('G5. 首批 2 账号自然 drain 落 succeeded', getJobAccount('job-g5', 'g5-0').status === 'succeeded' && getJobAccount('job-g5', 'g5-1').status === 'succeeded');
+    check('G5. 未 admit 的 pending → cancelled', ['g5-2', 'g5-3', 'g5-4', 'g5-5'].every((f) => getJobAccount('job-g5', f).status === 'cancelled'));
+    // (6) admission 口径：每条 admission inFlight<=limit；cancel 后不再新增 schedule 条目；maxInFlight 不含未 admit 的 cancelled
+    check('G6. schedule 每条 admission 记录 inFlight<=limit（与 C3-2/C3-3 既有不变量一致）', res.concurrency.schedule.every((s) => s.inFlight <= s.limit));
+    check('G6. cancel 后不再新增 admission（schedule 条目数==已 admit 账号数 2）', res.concurrency.schedule.length === 2);
+    check('G6. maxInFlight 不含从未 admit 的 cancelled 账号（=2）', res.concurrency.maxInFlight === 2);
+    // (7b) 稀疏压实：accounts 纯 AccountRunResult[]，无空洞 null、length=实际完成数、按 pending 相对顺序稳定
+    check('G7b. accounts 压实 length==实际完成数 2', res.accounts.length === 2);
+    // 空洞检测看**数组元素**是否 null（空洞序列化成 null 元素）；不能用 `.includes("null")` 子串——合法
+    // succeeded AccountRunResult 本身含 errorKind:null / errorMessage:null **字段**。JSON round-trip 后逐元素判非 null。
+    check('G7b. accounts 每项均有效、无空洞产生的 null 元素', JSON.parse(JSON.stringify(res.accounts)).every((a) => a !== null) && res.accounts.every((a) => a && a.status === 'succeeded'));
+    check('G7b. accounts 按 pending 相对顺序稳定（g5-0,g5-1）', JSON.stringify(res.accounts.map((a) => a.fakeid)) === JSON.stringify(['g5-0', 'g5-1']));
+  }
+
+  // G7a（§3.2 并发(7a)）：cancel-before-any-admit → accounts===[]（长度 0、非 [null,null,...]）。
+  {
+    const ids = ['g7a-0', 'g7a-1', 'g7a-2'];
+    createSyncJob({ id: 'job-g7a', requestedSince: 1000, accounts: ids.map((f, i) => ({ fakeid: f, priority: 10 - i })) });
+    jobs.requestCancel('job-g7a'); // 真实取消标记（run 前）
+    const fc = makeConcurrentFetcher({});
+    const res = await runSyncJobPool('job-g7a', { fetchPage: fc.fetchPage, isCancelRequested: (jid) => jobs.isCancelRequested(jid) });
+    check('G7a. cancel-before-admit → accounts===[]（长度 0，非 [null,...]）', res.accounts.length === 0 && JSON.stringify(res.accounts) === '[]');
+    check('G7a. job=cancelled、所有账号 cancelled', res.job.status === 'cancelled' && ids.every((f) => getJobAccount('job-g7a', f).status === 'cancelled'));
+    check('G7a. fetcher 零调用、maxInFlight=0、schedule 空', Object.keys(fc.calls).length === 0 && res.concurrency.maxInFlight === 0 && res.concurrency.schedule.length === 0);
+  }
+
+  // G8（§3.2 并发(8)，fix-must-fail i）：probe 在初次 pump 成功、后续 pump（worker 完成回调触发）抛错 →
+  //     有界 watchdog 证 pool reject（非永挂）；剩余账号未 admission、finalizeJob 未调用、job 保持 running。
+  {
+    const ids = ['g8-0', 'g8-1', 'g8-2', 'g8-3'];
+    createSyncJob({ id: 'job-g8', requestedSince: 1000, accounts: ids.map((f, i) => ({ fakeid: f, priority: 10 - i })) });
+    const fc = makeConcurrentFetcher({}, 15);
+    let probeCalls = 0;
+    const probe = () => {
+      probeCalls += 1;
+      if (probeCalls === 1) return false; // 初次 pump 成功 admit
+      throw new Error('probe DB failure'); // 后续 pump（worker 完成触发）抛错 = 系统故障
+    };
+    const pool = runSyncJobPool('job-g8', { fetchPage: fc.fetchPage, isCancelRequested: probe }, { levels: [2], startIndex: 0, healthyStreakToRaise: 100000 });
+    let timer;
+    const watchdog = new Promise((_r, rej) => { timer = setTimeout(() => rej(new Error('WATCHDOG_TIMEOUT')), 2000); });
+    let outcome = 'pending';
+    let err = null;
+    try {
+      await Promise.race([pool, watchdog]);
+      outcome = 'resolved';
+    } catch (e) {
+      err = e;
+      outcome = /WATCHDOG_TIMEOUT/.test(e && e.message) ? 'hang' : 'rejected';
+    } finally {
+      clearTimeout(timer); // 防 watchdog 晚到 reject 变孤儿 unhandledRejection
+    }
+    check('G8. probe 抛错 → pool reject（非永挂，watchdog 未命中）', outcome === 'rejected' && /probe DB failure/.test(err && err.message));
+    check('G8. 剩余账号未被 admission（g8-2/g8-3 保持 pending）', ['g8-2', 'g8-3'].every((f) => getJobAccount('job-g8', f).status === 'pending'));
+    check('G8. finalizeJob 未调用 → job 保持 running（非 cancelled，交 C3-5）', getSyncJob('job-g8').status === 'running');
+  }
+
+  // G9a（§3.2 并发(9a)，fix-must-fail e）：cancel 与 fatal 同发 → fatal 严格优先。确定性时序 fixture：
+  //   真实 requestCancel（持久态）+ probe 委托真实 registry（内存态）+ 受控 barrier（cancel 账号先完成触发 pump
+  //   观察 cancel；另一在飞 worker 随后以唯一 fatal sentinel reject）→ 断言 rejection === 该 sentinel、job running。
+  {
+    createSyncJob({ id: 'job-g9a', requestedSince: 1000, accounts: [{ fakeid: 'g9a-cancel', priority: 9 }, { fakeid: 'g9a-fatal', priority: 8 }] });
+    const FATAL = new Error('unique fatal sentinel g9a');
+    // 坏退避 clock：唯有 fatal worker 的退避 sleep 会调用它并抛 FATAL（cancel worker 成功、从不 sleep）。
+    const badBackoffClock = { now: () => 0, sleep: () => { throw FATAL; } };
+    const fetchPage = async ({ fakeid }) => {
+      if (fakeid === 'g9a-cancel') {
+        jobs.requestCancel('job-g9a'); // 真实持久取消标记（先于本 worker 完成 → 后续 pump 观察到）
+        return { articles: [article('c', 2000)], hasMore: false }; // 立即成功
+      }
+      // g9a-fatal：等 50ms（确保 cancel worker 已完成、pump 已置 cancelRequested），再 429 → 退避 → badClock 抛 FATAL。
+      await new Promise((r) => setTimeout(r, 50));
+      const e = new Error('rl'); e.status = 429; throw e;
+    };
+    const pool = runSyncJobPool('job-g9a',
+      { fetchPage, clock: badBackoffClock, retry: { maxAttempts: 3, baseDelayMs: 100, maxDelayMs: 1000, jitter: (d) => d }, isCancelRequested: (jid) => jobs.isCancelRequested(jid) },
+      { startIndex: 2, healthyStreakToRaise: 100000 }); // limit 4 ≥ 2 → 两账号同批 admit
+    let didReject = false;
+    let rejectedValue = 'UNSET';
+    try { await pool; } catch (e) { didReject = true; rejectedValue = e; }
+    check('G9a. cancel 与 fatal 同发 → pool reject（fatal 严格优先，未被 cancel 覆盖成 resolve）', didReject === true);
+    check('G9a. rejection value 严格 === 唯一 fatal sentinel（排除 P3/DB 次生异常冒充 fatal）', rejectedValue === FATAL);
+    check('G9a. job 保持 running（finalize 未执行、未落 cancelled，交 C3-5）', getSyncJob('job-g9a').status === 'running');
+    check('G9a. cancel 账号确已自然完成 succeeded（证 cancel 前已 admit 且 cancel 被 pump 观察）', getJobAccount('job-g9a', 'g9a-cancel').status === 'succeeded');
+  }
+
+  // G9b（§3.2 并发(9b)，fix-must-fail f）：cancel-only（无 fatal）→ resolve、job cancelled、剩余 pending → cancelled。
+  //   守 fixture 不变量（先真实 requestCancel）。
+  {
+    const ids = ['g9b-0', 'g9b-1', 'g9b-2'];
+    createSyncJob({ id: 'job-g9b', requestedSince: 1000, accounts: ids.map((f, i) => ({ fakeid: f, priority: 10 - i })) });
+    // limit 2；g9b-0 先完成（delay 10）并真实 requestCancel；g9b-1 自然完成；g9b-2 从未 admit → cancelled。
+    const fc = makeConcurrentFetcher({
+      'g9b-0': { delayMs: 10, handler: () => { jobs.requestCancel('job-g9b'); return { articles: [article('c0', 2000)], hasMore: false }; } },
+    }, 30);
+    const pool = runSyncJobPool('job-g9b',
+      { fetchPage: fc.fetchPage, isCancelRequested: (jid) => jobs.isCancelRequested(jid) },
+      { levels: [2], startIndex: 0, healthyStreakToRaise: 100000 });
+    let didResolve = false;
+    let resolvedValue = null;
+    try { resolvedValue = await pool; didResolve = true; } catch { didResolve = false; }
+    check('G9b. cancel-only → pool resolve（未被误当 fatal 而 reject）', didResolve === true);
+    check('G9b. job=cancelled', resolvedValue && resolvedValue.job.status === 'cancelled');
+    check('G9b. 首批 2 账号 succeeded、g9b-2 未 admit → cancelled', getJobAccount('job-g9b', 'g9b-0').status === 'succeeded' && getJobAccount('job-g9b', 'g9b-1').status === 'succeeded' && getJobAccount('job-g9b', 'g9b-2').status === 'cancelled');
+    check('G9b. accounts 压实 length=2（实际完成数）', resolvedValue && resolvedValue.accounts.length === 2);
+  }
+
+  // G 段收尾：确认 C3-4 用例未引入残留 unhandledRejection（watchdog/晚到 reject 均已消费）。
+  await new Promise((r) => setTimeout(r, 30));
+  check('G. C3-4 全程无残留 unhandledRejection', c33Unhandled.length === 0);
+
   console.log(`\nPASS smoke_mp_sync_runner: ${passed} assertions`);
 } catch (err) {
   console.error('FAIL smoke_mp_sync_runner:', err && err.stack ? err.stack : err);

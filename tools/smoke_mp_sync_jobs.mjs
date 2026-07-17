@@ -303,6 +303,137 @@ try {
     pcFinal.status === 'cancelled' && pcFinal.cancelRequestedAt !== null
   );
 
+  // ══════════════════════════════════════════════════════════════════════════
+  // C3-4 协作式取消持久层（方案 §3.1 E 段）：cancelPendingAccounts + isCancelRequested
+  //   17 混合态深等值 15 列快照 + interrupted 不被 clobber + 聚合不变
+  //   18 幂等二次调用（含“既有 cancelled 不被 clobber”：finished_at 不刷新、15 列不变）
+  //   19 E(P3) 绕过探针：未 requestCancel / job 不存在 → 抛错 + 事务回滚零副作用；requestCancel 后成功
+  //   20 isCancelRequested：未 req→false / req 后→true / 不存在 job→false
+  // 说明：cancelPendingAccounts 语义为“一次性把所有 pending 落 cancelled”，无法在单次调用构造“部分 pending
+  //       残留 + pre-existing cancelled”共存于同一快照；故“既有 cancelled 不被 clobber”由 18 的幂等二次调用
+  //       路径覆盖（第一次全 pending→cancelled，第二次 count=0 且 cancelled 账号 15 列逐字段不变）。
+  // MpSyncJobAccount 15 持久列（深等值全枚举）：jobId/fakeid/status/priority/pageCursor/sinceTime/
+  //   lastArticleTime/retryCount/newArticles/errorCode/errorMessage/createdAt/updatedAt/startedAt/finishedAt。
+  const snap15 = (jobId, fakeid) => JSON.stringify(jobs.getJobAccount(jobId, fakeid));
+
+  // ── 17. 混合态：只 pending→cancelled，其余账号 15 列逐字段不变；interrupted 不被 clobber；聚合不变 ──
+  {
+    jobs.createSyncJob({
+      id: 'job-c34-mix',
+      accounts: [
+        { fakeid: 'm-p1' }, { fakeid: 'm-p2' }, { fakeid: 'm-run' }, { fakeid: 'm-succ' },
+        { fakeid: 'm-fail' }, { fakeid: 'm-auth' }, { fakeid: 'm-intr' },
+      ],
+    });
+    jobs.startJob('job-c34-mix');
+    jobs.markAccountRunning('job-c34-mix', 'm-succ');
+    jobs.applyAccountOutcome('job-c34-mix', 'm-succ', { status: 'succeeded', newArticles: 2, pageCursor: 20, lastArticleTime: 111 });
+    jobs.markAccountRunning('job-c34-mix', 'm-fail');
+    jobs.applyAccountOutcome('job-c34-mix', 'm-fail', { status: 'failed', errorCode: 'timeout', errorMessage: 'boom' });
+    jobs.markAccountRunning('job-c34-mix', 'm-auth');
+    jobs.applyAccountOutcome('job-c34-mix', 'm-auth', { status: 'auth_required', errorCode: 'auth' });
+    // interrupted：先 running 再 reconcile（reconcile 是全局 running→interrupted；此刻 m-run 尚未 running、不受影响；
+    // 历史遗留的其它 running 账号被一并 reconcile，无后续断言依赖，无害）。
+    jobs.markAccountRunning('job-c34-mix', 'm-intr');
+    jobs.reconcileOrphanedJobs();
+    jobs.markAccountRunning('job-c34-mix', 'm-run'); // reconcile 之后再置 running → 保持 running
+
+    check('17. 前置态就绪（run=running/succ=succeeded/fail=failed/auth=auth_required/intr=interrupted）',
+      jobs.getJobAccount('job-c34-mix', 'm-run').status === 'running' &&
+      jobs.getJobAccount('job-c34-mix', 'm-succ').status === 'succeeded' &&
+      jobs.getJobAccount('job-c34-mix', 'm-fail').status === 'failed' &&
+      jobs.getJobAccount('job-c34-mix', 'm-auth').status === 'auth_required' &&
+      jobs.getJobAccount('job-c34-mix', 'm-intr').status === 'interrupted');
+
+    // 非 pending 账号 15 列快照（before）
+    const beforeRun = snap15('job-c34-mix', 'm-run');
+    const beforeSucc = snap15('job-c34-mix', 'm-succ');
+    const beforeFail = snap15('job-c34-mix', 'm-fail');
+    const beforeAuth = snap15('job-c34-mix', 'm-auth');
+    const beforeIntr = snap15('job-c34-mix', 'm-intr');
+    const jobBefore = jobs.getSyncJob('job-c34-mix');
+
+    jobs.requestCancel('job-c34-mix');
+    const count = jobs.cancelPendingAccounts('job-c34-mix');
+
+    check('17. cancelPendingAccounts 返回被改 pending 数=2', count === 2);
+    check('17. 两 pending 账号 → cancelled',
+      jobs.getJobAccount('job-c34-mix', 'm-p1').status === 'cancelled' &&
+      jobs.getJobAccount('job-c34-mix', 'm-p2').status === 'cancelled');
+    check('17. running 账号 15 列逐字段不变（深等值）', snap15('job-c34-mix', 'm-run') === beforeRun);
+    check('17. succeeded 账号 15 列逐字段不变（深等值）', snap15('job-c34-mix', 'm-succ') === beforeSucc);
+    check('17. failed 账号 15 列逐字段不变（深等值）', snap15('job-c34-mix', 'm-fail') === beforeFail);
+    check('17. auth_required 账号 15 列逐字段不变（深等值）', snap15('job-c34-mix', 'm-auth') === beforeAuth);
+    check('17. interrupted 账号 15 列逐字段不变（深等值，不被 clobber；ACCOUNT_TRANSITIONS 无 interrupted→cancelled）', snap15('job-c34-mix', 'm-intr') === beforeIntr);
+    const jobAfter = jobs.getSyncJob('job-c34-mix');
+    check('17. 聚合不变：cancelled 不计 succeeded/failed/processed',
+      jobAfter.succeededAccounts === jobBefore.succeededAccounts &&
+      jobAfter.failedAccounts === jobBefore.failedAccounts &&
+      jobAfter.processedAccounts === jobBefore.processedAccounts);
+    check('17. finalize → cancelled（cancelRequestedAt 驱动）', jobs.finalizeJob('job-c34-mix').status === 'cancelled');
+  }
+
+  // ── 18. idempotent + preserves existing cancelled rows（既有 cancelled 不被 clobber）──
+  // 说明：公开状态机不存在“部分 pending 与 pre-existing cancelled 共存于单快照”的可达路径（唯一写 cancelled
+  //       的入口就是 cancelPendingAccounts，且一次性把所有 pending 落 cancelled），故用**二次调用**验证同一
+  //       “不覆盖既有 cancelled”属性；两次调用之间插入**真实时间间隔（>1ms）**使 nowIso() 明显前进——若错误实现
+  //       刷新 finished_at，会写入更晚的新时间戳被本断言逮到（避免同毫秒的 vacuous pass）。本持久层 smoke 直连
+  //       真实 SQLite，但此处**不直接篡改内部 DB 行**。
+  {
+    jobs.createSyncJob({ id: 'job-c34-idem', accounts: [{ fakeid: 'i-a' }, { fakeid: 'i-b' }] });
+    jobs.startJob('job-c34-idem');
+    jobs.requestCancel('job-c34-idem');
+    const first = jobs.cancelPendingAccounts('job-c34-idem');
+    check('18. idempotent: 首次 cancel 两 pending → cancelled、count=2', first === 2 &&
+      jobs.getJobAccount('job-c34-idem', 'i-a').status === 'cancelled' &&
+      jobs.getJobAccount('job-c34-idem', 'i-b').status === 'cancelled');
+    const snapA = snap15('job-c34-idem', 'i-a');
+    const snapB = snap15('job-c34-idem', 'i-b');
+    // 明显不同的时间：真实等待使 nowIso() 前进（防同毫秒使 finished_at 断言 vacuous）。
+    await new Promise((r) => setTimeout(r, 25));
+    const second = jobs.cancelPendingAccounts('job-c34-idem'); // 此刻已无 pending
+    check('18. idempotent: 二次调用 count=0（仍过 P3 门，因 cancel_requested_at 仍非空）', second === 0);
+    check('18. preserves existing cancelled rows: 既有 cancelled 15 列逐字段不变（尤其 finished_at 未在更晚时刻被刷新）',
+      snap15('job-c34-idem', 'i-a') === snapA && snap15('job-c34-idem', 'i-b') === snapB);
+  }
+
+  // ── 19. E(P3) 绕过探针（F-C3-4-P3 核心保护）──
+  {
+    jobs.createSyncJob({ id: 'job-c34-p3', accounts: [{ fakeid: 'g-a' }, { fakeid: 'g-b' }] });
+    jobs.startJob('job-c34-p3');
+    jobs.markAccountRunning('job-c34-p3', 'g-b');
+    jobs.applyAccountOutcome('job-c34-p3', 'g-b', { status: 'succeeded', newArticles: 1 });
+    // (a) 未 requestCancel 直调 → 抛错 + 事务回滚（账号 + 聚合逐字段不变）
+    const beforeA = snap15('job-c34-p3', 'g-a');
+    const beforeB = snap15('job-c34-p3', 'g-b');
+    const jobBefore = jobs.getSyncJob('job-c34-p3');
+    throws('19a. 未 requestCancel 直调 cancelPendingAccounts 必抛错（P3 前置 fail-closed）', () => jobs.cancelPendingAccounts('job-c34-p3'));
+    check('19a. 回滚后账号 15 列逐字段不变（g-a pending / g-b succeeded 均不动）',
+      snap15('job-c34-p3', 'g-a') === beforeA && snap15('job-c34-p3', 'g-b') === beforeB);
+    const jobAfter = jobs.getSyncJob('job-c34-p3');
+    check('19a. 回滚后聚合逐字段不变',
+      jobAfter.succeededAccounts === jobBefore.succeededAccounts &&
+      jobAfter.failedAccounts === jobBefore.failedAccounts &&
+      jobAfter.processedAccounts === jobBefore.processedAccounts);
+    // (b) job 不存在 → 抛错、零副作用
+    throws('19b. job 不存在直调 cancelPendingAccounts 抛错', () => jobs.cancelPendingAccounts('job-does-not-exist'));
+    // (c) requestCancel 后再调 → 成功，仅 pending 批量变 cancelled（g-a），g-b succeeded 不动
+    jobs.requestCancel('job-c34-p3');
+    const okCount = jobs.cancelPendingAccounts('job-c34-p3');
+    check('19c. requestCancel 后调用成功、仅 pending g-a → cancelled（count=1）', okCount === 1 && jobs.getJobAccount('job-c34-p3', 'g-a').status === 'cancelled');
+    check('19c. g-b succeeded 仍不被 clobber', jobs.getJobAccount('job-c34-p3', 'g-b').status === 'succeeded');
+  }
+
+  // ── 20. isCancelRequested：未 req→false / req 后→true / 不存在 job→false ──
+  {
+    jobs.createSyncJob({ id: 'job-c34-probe', accounts: [{ fakeid: 'pr-a' }] });
+    jobs.startJob('job-c34-probe');
+    check('20. 未 requestCancel → isCancelRequested=false', jobs.isCancelRequested('job-c34-probe') === false);
+    jobs.requestCancel('job-c34-probe');
+    check('20. requestCancel 后 → isCancelRequested=true', jobs.isCancelRequested('job-c34-probe') === true);
+    check('20. 不存在的 job → isCancelRequested=false（防御不抛）', jobs.isCancelRequested('job-nope') === false);
+  }
+
   console.log(`\nPASS smoke_mp_sync_jobs: ${passed} assertions`);
 } catch (err) {
   console.error('FAIL smoke_mp_sync_jobs:', err && err.stack ? err.stack : err);
