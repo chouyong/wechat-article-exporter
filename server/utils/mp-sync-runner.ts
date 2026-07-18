@@ -18,6 +18,9 @@ import {
   finalizeJob,
   cancelPendingAccounts,
   isCancelRequested,
+  reconcileOrphanedJobs,
+  resetInterruptedAccounts,
+  listRunningJobIdsForRecovery,
   type MpSyncJob,
   type MpSyncJobAccount,
   type AccountOutcomeInput,
@@ -788,4 +791,102 @@ async function runWithRetry(
     await clock.sleep(computeBackoffDelay(attempt, retry)); // 退避（槽位保持，§2.6）；sleep/jitter 抛错向上传
     attempt = attempts;
   }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// C3-5 重启恢复编排（A 类·纯离线：复用既有 runSyncJobPool，不新写账号抓取循环）
+//
+// 方案：docs/PLAN_WECHAT_EXPORTER_C3_5_RESTART_RECOVERY.md（R2 Codex 方案层 GO）。切片边界：
+//   - 首版保守恢复：interrupted -> pending -> running，账号从头重跑（startBegin=0），**不做 page_cursor
+//     断点续跑、不改 PageFetcher 契约**，依赖既有 knownAids/aid 去重防重复结果。
+//   - 复用 runSyncJobPool（C3-2 起的生产并发原语，全仓唯一 ConcurrencyController）续跑，不复制账号抓取循环、
+//     不改 runSyncJob/runSyncJobPool/processAccount/runWithRetry 既有实现，不扩 RunSyncJobDeps 契约。
+//   - 无 DDL、无新持久态、不 bump schema（interrupted->pending 是既有合法迁移；registry 只新增
+//     resetInterruptedAccounts + listRunningJobIdsForRecovery 两原语）。
+//   - 生产启动接线（把 recoverInterruptedJobs 挂 Nitro 启动钩子）属后续切片（§5-P3），本切片纯离线编排 +
+//     测试直调；不接生产启动路径、不联网、不启动生产服务。
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * 重启恢复汇总。逐 job try/catch 使外层 Promise **即便 failed 非空也整体 resolve**。
+ *
+ * ⚠ 可观测契约（§2.2/§5-P3，N-C3-5-P3）：生产启动接线**必须**把非空 `failed` 当作「部分恢复失败」经
+ * **结构化日志 / 指标 / 告警**显式消费——**绝不能把 Promise fulfilled 当成「全部 job 恢复成功」**；`failed`
+ * 为空才是「全绿」的唯一判据。本片只写此返回契约（生产 logger + 启动屏障挂载见 §5-P3 待接线条件：awaited
+ * 屏障 / 恢复完成前新 runner 不得 admission / 非空 failed 必被消费 / fulfilled≠全成功；仅具体挂载机制待确认，
+ * 不引入定时 / daemon），不实现生产 logger。
+ */
+export interface RecoverySummary {
+  /** reconcileOrphanedJobs 结果（本次启动降级的孤儿 job / 账号数）。 */
+  reconciled: { jobs: number; accounts: number };
+  /** 正常续跑并 finalize（job.status !== 'cancelled'）的 jobId。 */
+  recovered: string[];
+  /** 收口为 cancelled 的 jobId（入口 cancel 分支 + reset 后途中 cancel 被 pool 收口）。 */
+  cancelled: string[];
+  /** 恢复中 fatal（job 仍 running、未 finalize，交下次进程重启的 reconcile）。 */
+  failed: Array<{ jobId: string; error: unknown }>;
+}
+
+/**
+ * 重启恢复编排（§2.2）：启动屏障 reconcileOrphanedJobs → listRunningJobIdsForRecovery 一次性无饥饿快照枚举
+ * 全部 running job → 逐 job recoverOneJob（cancel 严格优先 or reset + 复用 runSyncJobPool 续跑）→ 按 pool
+ * 返回的 job.status 分类 recovered/cancelled。**不新写账号抓取循环、不改 runner 既有函数。**
+ *
+ * **所有权 / 启动屏障（§2.4 P-O1，首版单进程假设）**：reconcileOrphanedJobs 是**全局** running->interrupted
+ * 操作（不按 job 过滤），故本函数只能在**确认旧进程 runner 不存在的启动阶段、任何新 job runner admission 之前
+ * 调用一次**，运行期绝不再调。本片可机器证明的是「单次 invocation 内部 reconcile 恰一次、且先于任何 job
+ * admission」（快照枚举与逐 job 恢复都在这一次 reconcile 之后）；「运行期不再次调用 / 新 runner 在恢复屏障完成
+ * 前不启动」属生产启动钩子的调用所有权，是后续接线验收（§5-P3），本片离线 smoke 无法证明、也不冒充。
+ *
+ * **单 job fatal 不阻断全局（§5-P4）**：逐 job try/catch——单 job fatal 记录进 summary.failed（不吞成成功、
+ * 不伪装账号 failed/cancelled），该 job 保持 running（未 finalize）交下次 reconcile，继续恢复下一个 job。
+ */
+export async function recoverInterruptedJobs(deps: RunSyncJobDeps): Promise<RecoverySummary> {
+  // 启动屏障：全局 running 账号 -> interrupted（job 仍 running）。本次 invocation 内 reconcile 恰一次、
+  // 先于任何 job admission（快照枚举与逐 job 恢复都在其后）。
+  const reconciled = reconcileOrphanedJobs();
+  const summary: RecoverySummary = { reconciled, recovered: [], cancelled: [], failed: [] };
+  // F-C3-5-P1：一次性无饥饿快照枚举全部 running job（非 listSyncJobs，避免 500 上限 + fatal 饥饿，见 registry
+  // listRunningJobIdsForRecovery）；created_at ASC, id ASC 全序。
+  for (const jobId of listRunningJobIdsForRecovery()) {
+    try {
+      const outcome = await recoverOneJob(jobId, deps);
+      if (outcome === 'cancelled') summary.cancelled.push(jobId);
+      else summary.recovered.push(jobId);
+    } catch (error) {
+      // 单 job fatal：不吞、不伪装成功；job 保持 running（未 finalize）交下次 reconcile；记录后继续下一个 job。
+      summary.failed.push({ jobId, error });
+    }
+  }
+  return summary;
+}
+
+/**
+ * 恢复单个 running job（§2.2）。**cancel 严格优先于恢复**（用户 2026-07-18 拍板）：
+ *   - 重启后 job 已请求取消 → 零 fetch、不拉起 interrupted 账号；复用 C3-4 cancelPendingAccounts + finalizeJob
+ *     收口 cancelled；interrupted 账号保留作崩溃历史事实（§5-P1，不新增 interrupted->cancelled 迁移）。
+ *   - 无 cancel → resetInterruptedAccounts 归一化 interrupted->pending，复用 runSyncJobPool 续跑全部 pending
+ *     （含刚 reset 的 + 原 pending）；finalize 由 pool 内部完成。
+ *
+ * **F-C3-5-P2：必须读 runSyncJobPool 返回的 job.status 分类**。「reset 后 / 途中 cancel 到达」时，pool 内
+ * C3-4 probe 观察 cancel → 停 admission → 排空 → cancelPendingAccounts → finalizeJob 返回 cancelled，且
+ * **正常 resolve（不 reject）**；若无条件 return 'recovered'，一次真实取消会被误记为 recovered（summary 失真）。
+ *
+ * probe 与 runSyncJobPool 内部同源解析（deps.isCancelRequested ?? 默认 registry probe），使入口 cancel 检查与
+ * pool 内部 cancel 检查一致。cancel-resolve 路径要求 cancel_requested_at 真实非空（cancelPendingAccounts 的
+ * P3 前置门）：生产默认 probe 读真库自然满足；测试注入替身走该路径时须先真实 requestCancel（见 smoke fixture 不变量）。
+ */
+async function recoverOneJob(jobId: string, deps: RunSyncJobDeps): Promise<'recovered' | 'cancelled'> {
+  const probe = deps.isCancelRequested ?? isCancelRequested;
+  // ── cancel 严格优先：重启后 job 已请求取消 → 零 fetch、不拉起 interrupted ──
+  if (probe(jobId)) {
+    cancelPendingAccounts(jobId); // pending->cancelled（P3 门：cancel_requested_at 非空）
+    finalizeJob(jobId); // cancelRequestedAt 非空 → cancelled
+    return 'cancelled'; // 不进 runner；interrupted 账号保留作崩溃历史事实（§5-P1）
+  }
+  // ── 无 cancel：interrupted->pending 归一化，复用 runSyncJobPool 续跑 ──
+  resetInterruptedAccounts(jobId); // interrupted->pending（P-R2 running 门保护）
+  const result = await runSyncJobPool(jobId, deps); // 续跑全部 pending（含刚 reset 的 + 原 pending）
+  // F-C3-5-P2：读 pool 返回值分类——「reset 后途中 cancel」pool 正常 resolve 且 job.status='cancelled'。
+  return result.job.status === 'cancelled' ? 'cancelled' : 'recovered';
 }

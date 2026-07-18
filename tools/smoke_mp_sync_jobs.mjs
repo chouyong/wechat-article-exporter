@@ -434,6 +434,252 @@ try {
     check('20. 不存在的 job → isCancelRequested=false（防御不抛）', jobs.isCancelRequested('job-nope') === false);
   }
 
+  // ══════════════════════════════════════════════════════════════════════════
+  // C3-5 重启恢复原语 resetInterruptedAccounts（方案 §3.1 H 段）
+  //   H1 基础 / H2 混合态只碰 interrupted（15 列深等值，含 cancelled 不被 clobber）/
+  //   H3 字段最小化含非 null error_* 逐字段保留（N-C3-5-P1）/ H4 P-R1·P-R2 fail-closed（含终态 job 回滚）/
+  //   H5 幂等 / H6 事务原子性（注入 UPDATE 后错误 → 全回滚）。
+  // 构造 interrupted 的可达路径：markAccountRunning 后 reconcileOrphanedJobs（全局 running→interrupted、
+  //   job 仍 running）。reconcile 全局性：只影响本 fixture 内当刻 running 的账号，历史 job 的账号被一并降级
+  //   不影响任何后续断言（各 H fixture 只断言自身账号）。
+
+  // ── H1 基础：running job 含 N interrupted → reset 返回 N、全 → pending、job 仍 running ──
+  {
+    jobs.createSyncJob({ id: 'job-h1', accounts: [{ fakeid: 'h1-a' }, { fakeid: 'h1-b' }, { fakeid: 'h1-c' }] });
+    jobs.startJob('job-h1');
+    for (const f of ['h1-a', 'h1-b', 'h1-c']) jobs.markAccountRunning('job-h1', f);
+    jobs.reconcileOrphanedJobs(); // h1-a/b/c running → interrupted，job-h1 仍 running
+    check('H1. 前置：3 账号 interrupted、job 仍 running',
+      ['h1-a', 'h1-b', 'h1-c'].every((f) => jobs.getJobAccount('job-h1', f).status === 'interrupted') &&
+      jobs.getSyncJob('job-h1').status === 'running');
+    const h1n = jobs.resetInterruptedAccounts('job-h1');
+    check('H1. reset 返回 count=3', h1n === 3);
+    check('H1. 全部 interrupted → pending',
+      ['h1-a', 'h1-b', 'h1-c'].every((f) => jobs.getJobAccount('job-h1', f).status === 'pending'));
+    check('H1. job.status 仍 running（不改 job 态）', jobs.getSyncJob('job-h1').status === 'running');
+  }
+
+  // ── H2 混合态：只 interrupted → pending，其余账号 15 列逐字段不变；聚合不变 ──
+  {
+    jobs.createSyncJob({
+      id: 'job-h2',
+      accounts: [
+        { fakeid: 'h2-int' }, { fakeid: 'h2-pend' }, { fakeid: 'h2-run' },
+        { fakeid: 'h2-succ' }, { fakeid: 'h2-fail' }, { fakeid: 'h2-auth' },
+      ],
+    });
+    jobs.startJob('job-h2');
+    jobs.markAccountRunning('job-h2', 'h2-int');
+    jobs.reconcileOrphanedJobs(); // h2-int running → interrupted（其余仍 pending，不受影响）
+    // reconcile 之后再布置其它态（否则会被 reconcile 一并降级）：
+    jobs.markAccountRunning('job-h2', 'h2-succ');
+    jobs.applyAccountOutcome('job-h2', 'h2-succ', { status: 'succeeded', newArticles: 2, pageCursor: 20, lastArticleTime: 111 });
+    jobs.markAccountRunning('job-h2', 'h2-fail');
+    jobs.applyAccountOutcome('job-h2', 'h2-fail', { status: 'failed', errorCode: 'timeout', errorMessage: 'boom' });
+    jobs.markAccountRunning('job-h2', 'h2-auth');
+    jobs.applyAccountOutcome('job-h2', 'h2-auth', { status: 'auth_required', errorCode: 'auth' });
+    jobs.markAccountRunning('job-h2', 'h2-run'); // 保持 running（H2 内无后续 reconcile）
+    check('H2. 前置态就绪（int/pend/run/succ/fail/auth）',
+      jobs.getJobAccount('job-h2', 'h2-int').status === 'interrupted' &&
+      jobs.getJobAccount('job-h2', 'h2-pend').status === 'pending' &&
+      jobs.getJobAccount('job-h2', 'h2-run').status === 'running' &&
+      jobs.getJobAccount('job-h2', 'h2-succ').status === 'succeeded' &&
+      jobs.getJobAccount('job-h2', 'h2-fail').status === 'failed' &&
+      jobs.getJobAccount('job-h2', 'h2-auth').status === 'auth_required');
+    const bPend = snap15('job-h2', 'h2-pend');
+    const bRun = snap15('job-h2', 'h2-run');
+    const bSucc = snap15('job-h2', 'h2-succ');
+    const bFail = snap15('job-h2', 'h2-fail');
+    const bAuth = snap15('job-h2', 'h2-auth');
+    const jobBefore = jobs.getSyncJob('job-h2');
+    const h2n = jobs.resetInterruptedAccounts('job-h2');
+    check('H2. reset 只改 interrupted、count=1', h2n === 1);
+    check('H2. interrupted → pending', jobs.getJobAccount('job-h2', 'h2-int').status === 'pending');
+    check('H2. pending 账号 15 列逐字段不变（深等值）', snap15('job-h2', 'h2-pend') === bPend);
+    check('H2. running 账号 15 列逐字段不变（深等值）', snap15('job-h2', 'h2-run') === bRun);
+    check('H2. succeeded 账号 15 列逐字段不变（深等值）', snap15('job-h2', 'h2-succ') === bSucc);
+    check('H2. failed 账号 15 列逐字段不变（深等值）', snap15('job-h2', 'h2-fail') === bFail);
+    check('H2. auth_required 账号 15 列逐字段不变（深等值）', snap15('job-h2', 'h2-auth') === bAuth);
+    const jobAfter = jobs.getSyncJob('job-h2');
+    check('H2. 聚合不变（interrupted/pending 均不计 succeeded/failed/processed）',
+      jobAfter.succeededAccounts === jobBefore.succeededAccounts &&
+      jobAfter.failedAccounts === jobBefore.failedAccounts &&
+      jobAfter.processedAccounts === jobBefore.processedAccounts);
+  }
+
+  // ── H2b cancelled 不被 clobber：job 含 interrupted + cancelled（可达构造）→ reset 只碰 interrupted ──
+  // （公开状态机下 cancelled 只能由 cancelPendingAccounts 从 pending 产生；此处让 interrupted 与 cancelled 共存、
+  //   无残留 pending，验证 reset 的 WHERE 源门绝不触及 cancelled。）
+  {
+    jobs.createSyncJob({ id: 'job-h2b', accounts: [{ fakeid: 'b-int' }, { fakeid: 'b-c1' }, { fakeid: 'b-c2' }] });
+    jobs.startJob('job-h2b');
+    jobs.markAccountRunning('job-h2b', 'b-int');
+    jobs.reconcileOrphanedJobs(); // b-int → interrupted（b-c1/c2 仍 pending）
+    jobs.requestCancel('job-h2b');
+    const cN = jobs.cancelPendingAccounts('job-h2b'); // b-c1/c2 pending → cancelled（b-int interrupted 不被碰）
+    check('H2b. 前置：cancelPendingAccounts 只落 2 pending → cancelled，b-int 仍 interrupted',
+      cN === 2 && jobs.getJobAccount('job-h2b', 'b-int').status === 'interrupted' &&
+      jobs.getJobAccount('job-h2b', 'b-c1').status === 'cancelled' &&
+      jobs.getJobAccount('job-h2b', 'b-c2').status === 'cancelled');
+    const bC1 = snap15('job-h2b', 'b-c1');
+    const bC2 = snap15('job-h2b', 'b-c2');
+    const h2bn = jobs.resetInterruptedAccounts('job-h2b'); // job 仍 running（未 finalize）→ P-R2 过
+    check('H2b. reset 只改 interrupted、count=1', h2bn === 1);
+    check('H2b. interrupted → pending', jobs.getJobAccount('job-h2b', 'b-int').status === 'pending');
+    check('H2b. cancelled 账号 15 列逐字段不变（不被 clobber）',
+      snap15('job-h2b', 'b-c1') === bC1 && snap15('job-h2b', 'b-c2') === bC2);
+  }
+
+  // ── H3 字段最小化（含非 null error_* 逐字段保留，N-C3-5-P1）──
+  // 可达路径：failed（带 error_*/page_cursor/retry_count/started_at）→ markAccountRunning（failed→running
+  //   不清 error_*）→ reconcile 降级 interrupted → 得到「带非 null error_* 的 interrupted 账号」。
+  {
+    jobs.createSyncJob({ id: 'job-h3', accounts: [{ fakeid: 'h3-a' }] });
+    jobs.startJob('job-h3');
+    jobs.markAccountRunning('job-h3', 'h3-a');
+    jobs.applyAccountOutcome('job-h3', 'h3-a', {
+      status: 'failed', newArticles: 5, pageCursor: 42, lastArticleTime: 999, errorCode: 'timeout', errorMessage: 'boom',
+    });
+    jobs.markAccountRunning('job-h3', 'h3-a'); // failed → running（不清 error_*/page_cursor/retry_count）
+    jobs.reconcileOrphanedJobs(); // running → interrupted
+    const before = jobs.getJobAccount('job-h3', 'h3-a');
+    check('H3. 前置：interrupted 账号带非 null error_* / page_cursor=42 / retry_count=1 / started_at 非空',
+      before.status === 'interrupted' && before.errorCode === 'timeout' && before.errorMessage === 'boom' &&
+      before.pageCursor === 42 && before.retryCount === 1 && before.startedAt !== null);
+    const h3n = jobs.resetInterruptedAccounts('job-h3');
+    const after = jobs.getJobAccount('job-h3', 'h3-a');
+    check('H3. reset count=1、interrupted → pending', h3n === 1 && after.status === 'pending');
+    check('H3. error_code 非 null 逐字段原样保留（未被清）', after.errorCode === 'timeout');
+    check('H3. error_message 非 null 逐字段原样保留（未被清）', after.errorMessage === 'boom');
+    check('H3. started_at 保留（COALESCE，不刷新）', after.startedAt === before.startedAt);
+    check('H3. retry_count 保留=1（不清）', after.retryCount === 1);
+    check('H3. page_cursor 保留=42（不动）', after.pageCursor === 42);
+    check('H3. newArticles / lastArticleTime / finished_at 保留',
+      after.newArticles === before.newArticles && after.lastArticleTime === before.lastArticleTime &&
+      after.finishedAt === before.finishedAt);
+    check('H3. 仅 status 与 updated_at 变（updated_at 前进或相等）', after.updatedAt >= before.updatedAt);
+  }
+
+  // ── H4 P-R1/P-R2 fail-closed（含终态 job 回滚零副作用）──
+  {
+    // (a) job 不存在 → 抛 P-R1 not found（强化断言：区分干净 not found vs 移除 P-R1 后的下游 null deref，供 fix-must-fail (c)）
+    let h4aErr;
+    try { jobs.resetInterruptedAccounts('job-h4-nope'); } catch (e) { h4aErr = e; }
+    check('H4a. 不存在 job → 抛 P-R1 not found（非下游 null deref）', h4aErr instanceof Error && /not found/.test(h4aErr.message));
+
+    // (b) queued（未 startJob）→ 抛错、pending 账号不变
+    jobs.createSyncJob({ id: 'job-h4-q', accounts: [{ fakeid: 'q-a' }] });
+    const qBefore = snap15('job-h4-q', 'q-a');
+    throws('H4b-queued. queued job → 抛错（P-R2）', () => jobs.resetInterruptedAccounts('job-h4-q'));
+    check('H4b-queued. 回滚后 pending 账号 15 列不变', snap15('job-h4-q', 'q-a') === qBefore);
+
+    // (b) partial（含 interrupted 账号）→ 抛错、interrupted 账号 + 聚合逐字段不变（强回滚断言）
+    jobs.createSyncJob({ id: 'job-h4-p', accounts: [{ fakeid: 'p-int' }, { fakeid: 'p-succ' }] });
+    jobs.startJob('job-h4-p');
+    jobs.markAccountRunning('job-h4-p', 'p-int');
+    jobs.reconcileOrphanedJobs(); // p-int → interrupted
+    jobs.markAccountRunning('job-h4-p', 'p-succ');
+    jobs.applyAccountOutcome('job-h4-p', 'p-succ', { status: 'succeeded', newArticles: 1 });
+    check('H4b-partial. 前置 → partial（1 succeeded + 1 interrupted）', jobs.finalizeJob('job-h4-p').status === 'partial');
+    const pIntBefore = snap15('job-h4-p', 'p-int');
+    const pJobBefore = jobs.getSyncJob('job-h4-p');
+    throws('H4b-partial. partial job → 抛错（P-R2）', () => jobs.resetInterruptedAccounts('job-h4-p'));
+    check('H4b-partial. 回滚后 interrupted 账号 15 列不变（未被 reset 成 pending）', snap15('job-h4-p', 'p-int') === pIntBefore);
+    const pJobAfter = jobs.getSyncJob('job-h4-p');
+    check('H4b-partial. 回滚后 job 聚合逐字段不变',
+      pJobAfter.succeededAccounts === pJobBefore.succeededAccounts &&
+      pJobAfter.failedAccounts === pJobBefore.failedAccounts &&
+      pJobAfter.processedAccounts === pJobBefore.processedAccounts);
+
+    // (b) failed → 抛错
+    jobs.createSyncJob({ id: 'job-h4-f', accounts: [{ fakeid: 'f-a' }] });
+    jobs.startJob('job-h4-f');
+    jobs.markAccountRunning('job-h4-f', 'f-a');
+    jobs.applyAccountOutcome('job-h4-f', 'f-a', { status: 'failed', errorCode: 'x' });
+    check('H4b-failed. 前置 → failed', jobs.finalizeJob('job-h4-f').status === 'failed');
+    throws('H4b-failed. failed job → 抛错（P-R2）', () => jobs.resetInterruptedAccounts('job-h4-f'));
+
+    // (b) completed → 抛错
+    jobs.createSyncJob({ id: 'job-h4-c', accounts: [{ fakeid: 'c-a' }] });
+    jobs.startJob('job-h4-c');
+    jobs.markAccountRunning('job-h4-c', 'c-a');
+    jobs.applyAccountOutcome('job-h4-c', 'c-a', { status: 'succeeded', newArticles: 1 });
+    check('H4b-completed. 前置 → completed', jobs.finalizeJob('job-h4-c').status === 'completed');
+    throws('H4b-completed. completed job → 抛错（P-R2）', () => jobs.resetInterruptedAccounts('job-h4-c'));
+
+    // (b) cancelled（含 interrupted 账号）→ 抛错、interrupted 账号不变（强回滚断言）
+    jobs.createSyncJob({ id: 'job-h4-x', accounts: [{ fakeid: 'x-int' }, { fakeid: 'x-c' }] });
+    jobs.startJob('job-h4-x');
+    jobs.markAccountRunning('job-h4-x', 'x-int');
+    jobs.reconcileOrphanedJobs(); // x-int → interrupted
+    jobs.requestCancel('job-h4-x');
+    jobs.cancelPendingAccounts('job-h4-x'); // x-c pending → cancelled
+    check('H4b-cancelled. 前置 → cancelled（含 interrupted 账号）', jobs.finalizeJob('job-h4-x').status === 'cancelled');
+    const xIntBefore = snap15('job-h4-x', 'x-int');
+    throws('H4b-cancelled. cancelled job → 抛错（P-R2）', () => jobs.resetInterruptedAccounts('job-h4-x'));
+    check('H4b-cancelled. 回滚后 interrupted 账号 15 列不变', snap15('job-h4-x', 'x-int') === xIntBefore);
+  }
+
+  // ── H5 幂等：job 仍 running 且已无 interrupted → count=0、无副作用（深等值不变）──
+  {
+    jobs.createSyncJob({ id: 'job-h5', accounts: [{ fakeid: 'h5-a' }, { fakeid: 'h5-b' }] });
+    jobs.startJob('job-h5');
+    for (const f of ['h5-a', 'h5-b']) jobs.markAccountRunning('job-h5', f);
+    jobs.reconcileOrphanedJobs(); // → interrupted
+    check('H5. 首次 reset count=2', jobs.resetInterruptedAccounts('job-h5') === 2);
+    const aSnap = snap15('job-h5', 'h5-a');
+    const bSnap = snap15('job-h5', 'h5-b');
+    const second = jobs.resetInterruptedAccounts('job-h5'); // 已无 interrupted、job 仍 running
+    check('H5. 二次 reset count=0（仍过 P-R1/P-R2 门）', second === 0);
+    check('H5. 二次调用无副作用：两账号 15 列逐字段不变',
+      snap15('job-h5', 'h5-a') === aSnap && snap15('job-h5', 'h5-b') === bSnap);
+  }
+
+  // ── H6 事务原子性：UPDATE 之后（聚合重算处）注入错误 → 全回滚（interrupted 账号 + 聚合逐字段不变）──
+  // 故障注入=临时包裹共享连接 db.prepare 在「聚合 UPDATE」处抛错（此刻 interrupted→pending 的 UPDATE 已执行、
+  //   但在同一 BEGIN IMMEDIATE 内），验证 catch→ROLLBACK 把已发生的行改写完整撤销。不篡改任何 DB 行。
+  {
+    jobs.createSyncJob({ id: 'job-h6', accounts: [{ fakeid: 'h6-a' }, { fakeid: 'h6-b' }] });
+    jobs.startJob('job-h6');
+    for (const f of ['h6-a', 'h6-b']) jobs.markAccountRunning('job-h6', f);
+    jobs.reconcileOrphanedJobs(); // → interrupted
+    const bA = snap15('job-h6', 'h6-a');
+    const bB = snap15('job-h6', 'h6-b');
+    const jobBefore = jobs.getSyncJob('job-h6');
+    const db = registry.getMpSyncDatabase();
+    const origPrepare = db.prepare.bind(db);
+    let threw = false;
+    try {
+      db.prepare = (sql) => {
+        // 聚合重算的 UPDATE（在 interrupted→pending 的 UPDATE 之后、COMMIT 之前）注入失败。
+        if (typeof sql === 'string' && sql.includes('succeeded_accounts = ?')) {
+          throw new Error('injected aggregate UPDATE failure (H6 fault injection)');
+        }
+        return origPrepare(sql);
+      };
+      try {
+        jobs.resetInterruptedAccounts('job-h6');
+      } catch {
+        threw = true;
+      }
+    } finally {
+      db.prepare = origPrepare; // 无论如何还原，避免污染后续用例
+    }
+    check('H6. 注入聚合 UPDATE 失败 → reset 抛错', threw);
+    check('H6. 全回滚：两 interrupted 账号 15 列逐字段不变（interrupted→pending 的写被撤销）',
+      snap15('job-h6', 'h6-a') === bA && snap15('job-h6', 'h6-b') === bB);
+    check('H6. 全回滚后账号仍 interrupted（未落 pending）',
+      jobs.getJobAccount('job-h6', 'h6-a').status === 'interrupted' &&
+      jobs.getJobAccount('job-h6', 'h6-b').status === 'interrupted');
+    const jobAfter = jobs.getSyncJob('job-h6');
+    check('H6. 全回滚：job 聚合逐字段不变',
+      jobAfter.succeededAccounts === jobBefore.succeededAccounts &&
+      jobAfter.failedAccounts === jobBefore.failedAccounts &&
+      jobAfter.processedAccounts === jobBefore.processedAccounts);
+    // 还原后 reset 正常工作（证明 db.prepare 已复原、无残留副作用）
+    check('H6. 还原后 reset 正常 count=2', jobs.resetInterruptedAccounts('job-h6') === 2);
+  }
+
   console.log(`\nPASS smoke_mp_sync_jobs: ${passed} assertions`);
 } catch (err) {
   console.error('FAIL smoke_mp_sync_jobs:', err && err.stack ? err.stack : err);

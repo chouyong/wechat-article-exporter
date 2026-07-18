@@ -1598,6 +1598,227 @@ try {
   await new Promise((r) => setTimeout(r, 30));
   check('G. C3-4 全程无残留 unhandledRejection', c33Unhandled.length === 0);
 
+  // ══════════════════════════════════════════════════════════════════════════
+  // I 段（C3-5 重启恢复编排 recoverInterruptedJobs / recoverOneJob，方案 §3.2）
+  //   I1 reconcile 语义 / I2 恢复闭环 / I3+I4 混合态恢复 & 已 succeeded 零 fetch /
+  //   I5 helper fail-closed / I6 helper 幂等 / I7+I8 worker fatal & 二次重启再恢复 /
+  //   I9 cancel 严格优先 / I10 reset 后 admission 前 cancel（summary 分类，F-C3-5-P2）/
+  //   I11 去重（诚实限定 runner/service 层）/ I12 >500+fatal 前缀不饥饿（F-C3-5-P1）/
+  //   I13 多 job fatal 连续不中断全局（N-C3-5-P2）。
+  //
+  // 隔离铁律：recoverInterruptedJobs 内部先全局 reconcileOrphanedJobs 再 listRunningJobIdsForRecovery 枚举
+  //   **所有** running job；A–G 段遗留多个 running job（B8/D7/D10/F8/F12c/G8/G9a），若不清会被误捞进本段
+  //   summary。故每个 I 块开头 clearAllJobs() 清空 job 表（纯测试隔离，非伪造可达态）。
+  function clearAllJobs() {
+    const db = registry.getMpSyncDatabase();
+    db.exec('DELETE FROM mp_sync_job_accounts; DELETE FROM mp_sync_jobs;');
+  }
+  // 模拟「崩溃时正在跑」：账号停在 running（不预 reconcile）；recoverInterruptedJobs 的启动屏障会 reconcile → interrupted。
+  function crashedJob(jobId, fakeids) {
+    createSyncJob({ id: jobId, requestedSince: 1000, accounts: fakeids.map((f, i) => ({ fakeid: f, priority: 100 - i })) });
+    jobs.startJob(jobId);
+    for (const f of fakeids) jobs.markAccountRunning(jobId, f);
+  }
+
+  // ── I1 reconcile 语义（runner 侧）：running job + running 账号 → reconcile → 账号 interrupted、job 仍 running ──
+  {
+    clearAllJobs();
+    createSyncJob({ id: 'job-i1', requestedSince: 1000, accounts: [{ fakeid: 'i1-a' }, { fakeid: 'i1-b' }] });
+    jobs.startJob('job-i1');
+    jobs.markAccountRunning('job-i1', 'i1-a');
+    const rec = jobs.reconcileOrphanedJobs();
+    check('I1. running 账号 → interrupted', getJobAccount('job-i1', 'i1-a').status === 'interrupted');
+    check('I1. job 仍 running（待恢复）', getSyncJob('job-i1').status === 'running');
+    check('I1. reconcile 统计 jobs>=1 accounts>=1', rec.jobs >= 1 && rec.accounts >= 1);
+  }
+
+  // ── I2 恢复闭环：崩溃(interrupted) → recoverInterruptedJobs → 先 pending 化再跑完 → completed；summary.recovered 含之 ──
+  {
+    clearAllJobs();
+    crashedJob('job-i2', ['i2-a', 'i2-b']);
+    const { fetchPage, calls } = makeRoutingFetcher({
+      'i2-a': () => ({ articles: [article('a', 2000)], hasMore: false }),
+      'i2-b': () => ({ articles: [article('b', 2000)], hasMore: false }),
+    });
+    const summary = await runner.recoverInterruptedJobs({ fetchPage });
+    check('I2. summary.recovered 含 job-i2', summary.recovered.includes('job-i2'));
+    check('I2. 启动屏障 reconcile 恰捕获崩溃态（reconciled.accounts=2、jobs=1）', summary.reconciled.accounts === 2 && summary.reconciled.jobs === 1);
+    check('I2. interrupted 先 pending 化再跑完 → 两账号 succeeded', ['i2-a', 'i2-b'].every((f) => getJobAccount('job-i2', f).status === 'succeeded'));
+    check('I2. 两账号确被 fetch（各 1 次）', calls['i2-a'] === 1 && calls['i2-b'] === 1);
+    check('I2. job=completed', getSyncJob('job-i2').status === 'completed');
+    check('I2. summary.failed/cancelled 空', summary.failed.length === 0 && summary.cancelled.length === 0);
+  }
+
+  // ── I3 混合态恢复 + I4 已 succeeded 零 fetch：interrupted + pending + succeeded → 恢复只跑 interrupted/pending ──
+  {
+    clearAllJobs();
+    createSyncJob({ id: 'job-i3', requestedSince: 1000, accounts: [{ fakeid: 'i3-succ', priority: 9 }, { fakeid: 'i3-int', priority: 8 }, { fakeid: 'i3-pend', priority: 7 }] });
+    jobs.startJob('job-i3');
+    jobs.markAccountRunning('job-i3', 'i3-succ');
+    jobs.applyAccountOutcome('job-i3', 'i3-succ', { status: 'succeeded', newArticles: 3, pageCursor: 20, lastArticleTime: 111 });
+    jobs.markAccountRunning('job-i3', 'i3-int'); // 崩溃点：停在 running → 屏障 reconcile 成 interrupted
+    const succBefore = JSON.stringify(getJobAccount('job-i3', 'i3-succ'));
+    const { fetchPage, calls } = makeRoutingFetcher({
+      'i3-int': () => ({ articles: [article('x', 2000)], hasMore: false }),
+      'i3-pend': () => ({ articles: [article('y', 2000)], hasMore: false }),
+      'i3-succ': () => { throw new Error('已 succeeded 账号不应被 fetch'); },
+    });
+    const summary = await runner.recoverInterruptedJobs({ fetchPage });
+    check('I3. summary.recovered 含 job-i3', summary.recovered.includes('job-i3'));
+    check('I3. interrupted 与既有 pending 均跑完 succeeded', getJobAccount('job-i3', 'i3-int').status === 'succeeded' && getJobAccount('job-i3', 'i3-pend').status === 'succeeded');
+    check('I3. job=completed', getSyncJob('job-i3').status === 'completed');
+    check('I4. 已 succeeded 账号零 fetch（fetcher 从未收到 i3-succ）', (calls['i3-succ'] ?? 0) === 0);
+    check('I4. 已 succeeded 账号字段完全不变（未被二次抓取/改写）', JSON.stringify(getJobAccount('job-i3', 'i3-succ')) === succBefore);
+  }
+
+  // ── I5 helper fail-closed（编排依赖、不吞）：resetInterruptedAccounts 对不存在/非 running job 抛错（呼应 H4）──
+  {
+    clearAllJobs();
+    let threwNope = false;
+    try { jobs.resetInterruptedAccounts('job-i5-nope'); } catch { threwNope = true; }
+    check('I5. reset 不存在 job → 抛错（P-R1）', threwNope);
+    createSyncJob({ id: 'job-i5-q', requestedSince: 1000, accounts: [{ fakeid: 'i5-a' }] }); // queued（未 startJob）
+    let threwQueued = false;
+    try { jobs.resetInterruptedAccounts('job-i5-q'); } catch { threwQueued = true; }
+    check('I5. reset queued job → 抛错（P-R2）+ 账号仍 pending', threwQueued && getJobAccount('job-i5-q', 'i5-a').status === 'pending');
+  }
+
+  // ── I6 helper 幂等（同一恢复周期）：reset 递减到 0、无副作用 ──
+  {
+    clearAllJobs();
+    crashedJob('job-i6', ['i6-a', 'i6-b']);
+    jobs.reconcileOrphanedJobs(); // → interrupted
+    check('I6. 首次 reset count=2', jobs.resetInterruptedAccounts('job-i6') === 2);
+    check('I6. 二次 reset count=0（同周期幂等，job 仍 running）', jobs.resetInterruptedAccounts('job-i6') === 0);
+    check('I6. 两账号均 pending（无副作用）', ['i6-a', 'i6-b'].every((f) => getJobAccount('job-i6', f).status === 'pending'));
+  }
+
+  // ── I7 worker fatal + I8 二次重启再恢复（持久态收敛）：一个 block、job-i7 贯穿两次恢复 ──
+  {
+    clearAllJobs();
+    crashedJob('job-i7', ['i7-a', 'i7-b']);
+    // I7：注入 resolver 系统故障（=D7/B8 同机制）→ runSyncJobPool reject → recoverOneJob 抛 → summary.failed；job 保持 running。
+    const { fetchPage: fp1 } = makeRoutingFetcher({ 'i7-a': () => ({ articles: [], hasMore: false }), 'i7-b': () => ({ articles: [], hasMore: false }) });
+    const summary1 = await runner.recoverInterruptedJobs({ fetchPage: fp1, resolveOptions: () => { throw new Error('recovery worker fatal'); } });
+    check('I7. worker fatal → summary.failed 含 job-i7', summary1.failed.some((f) => f.jobId === 'job-i7'));
+    check('I7. fatal 记录了 error 对象', summary1.failed.find((f) => f.jobId === 'job-i7')?.error instanceof Error);
+    check('I7. job 保持 running（未误 finalize）', getSyncJob('job-i7').status === 'running');
+    check('I7. summary.recovered 不含 job-i7（未伪装成功）', !summary1.recovered.includes('job-i7'));
+    // I8：换正常 fetcher 再次 recoverInterruptedJobs（不清表，同 job-i7）→ 最终 finalize completed。
+    const { fetchPage: fp2 } = makeRoutingFetcher({ 'i7-a': () => ({ articles: [article('a', 2000)], hasMore: false }), 'i7-b': () => ({ articles: [article('b', 2000)], hasMore: false }) });
+    const summary2 = await runner.recoverInterruptedJobs({ fetchPage: fp2 });
+    check('I8. 二次恢复 → summary.recovered 含 job-i7', summary2.recovered.includes('job-i7'));
+    check('I8. 持久态收敛：最终 job=completed、两账号 succeeded', getSyncJob('job-i7').status === 'completed' && ['i7-a', 'i7-b'].every((f) => getJobAccount('job-i7', f).status === 'succeeded'));
+  }
+
+  // ── I9 cancel 严格优先：重启后 job 已 requestCancel → 零 fetch、interrupted 保留、pending → cancelled、job cancelled ──
+  {
+    clearAllJobs();
+    createSyncJob({ id: 'job-i9', requestedSince: 1000, accounts: [{ fakeid: 'i9-int', priority: 9 }, { fakeid: 'i9-pend', priority: 8 }] });
+    jobs.startJob('job-i9');
+    jobs.markAccountRunning('job-i9', 'i9-int'); // 崩溃点 → 屏障 reconcile 成 interrupted
+    jobs.requestCancel('job-i9'); // 真实取消标记（默认 registry probe 读它 → true）
+    const { fetchPage, calls } = makeRoutingFetcher({
+      'i9-int': () => { throw new Error('cancel 优先：interrupted 不应被拉起 fetch'); },
+      'i9-pend': () => { throw new Error('cancel 优先：pending 不应被 fetch'); },
+    });
+    const summary = await runner.recoverInterruptedJobs({ fetchPage }); // 默认 probe（未注入）
+    check('I9. summary.cancelled 含 job-i9', summary.cancelled.includes('job-i9'));
+    check('I9. 零 fetch（假 fetcher 从未被调用）', Object.keys(calls).length === 0);
+    check('I9. interrupted 账号保留（未被拉起，仍 interrupted）', getJobAccount('job-i9', 'i9-int').status === 'interrupted');
+    check('I9. pending → cancelled', getJobAccount('job-i9', 'i9-pend').status === 'cancelled');
+    check('I9. job=cancelled（cancel 分支 finalizeJob 收口）', getSyncJob('job-i9').status === 'cancelled');
+    check('I9. summary.recovered 不含 job-i9', !summary.recovered.includes('job-i9'));
+  }
+
+  // ── I10 reset 后 / admission 前 cancel（summary 分类断言，F-C3-5-P2 关键）──
+  // 入口 probe=false（走 reset+pool）；pool pump probe=true（观察 cancel → 收口 cancelled、正常 resolve）。
+  // recoverOneJob 必须读 pool 返回 job.status==='cancelled' → 分类 cancelled；③ 是抓 (l) 的关键断言。
+  {
+    clearAllJobs();
+    createSyncJob({ id: 'job-i10', requestedSince: 1000, accounts: [{ fakeid: 'i10-a', priority: 9 }, { fakeid: 'i10-b', priority: 8 }] });
+    jobs.startJob('job-i10');
+    for (const f of ['i10-a', 'i10-b']) jobs.markAccountRunning('job-i10', f); // 崩溃点
+    jobs.requestCancel('job-i10'); // 真实持久标记（cancelPendingAccounts P3 门需要）
+    let probeCalls = 0;
+    const probe = () => {
+      probeCalls += 1;
+      return probeCalls > 1; // #1 recoverOneJob 入口 false → 进 reset+pool；#2 pool pump true → 收口 cancelled
+    };
+    const { fetchPage, calls } = makeRoutingFetcher({
+      'i10-a': () => ({ articles: [article('a', 2000)], hasMore: false }),
+      'i10-b': () => ({ articles: [article('b', 2000)], hasMore: false }),
+    });
+    const summary = await runner.recoverInterruptedJobs({ fetchPage, isCancelRequested: probe });
+    check('I10①. cancel 被观察后持久态 job → cancelled', getSyncJob('job-i10').status === 'cancelled');
+    check('I10①. reset 后的 pending 被 pool 收口 → cancelled、零 fetch（pool 未 admit）', getJobAccount('job-i10', 'i10-a').status === 'cancelled' && getJobAccount('job-i10', 'i10-b').status === 'cancelled' && Object.keys(calls).length === 0);
+    check('I10②. recoverOneJob 读 pool 返回 job.status=cancelled → 分类 cancelled（summary.cancelled 含 job-i10）', summary.cancelled.includes('job-i10'));
+    check('I10③. summary 分类：job-i10 只入 cancelled、绝不入 recovered（F-C3-5-P2）', summary.cancelled.includes('job-i10') && !summary.recovered.includes('job-i10'));
+  }
+
+  // ── I11 去重（诚实限定 runner/service 层）：interrupted 账号从头重跑，knownAids 去重，结果不含重复 aid ──
+  {
+    clearAllJobs();
+    crashedJob('job-i11', ['i11-a']);
+    const { fetchPage } = makeRoutingFetcher({
+      'i11-a': () => ({ articles: [article('dup-1', 2000), article('new-1', 1990)], hasMore: false }),
+    });
+    const summary = await runner.recoverInterruptedJobs({ fetchPage, resolveOptions: () => ({ knownAids: ['dup-1'] }) });
+    check('I11. summary.recovered 含 job-i11', summary.recovered.includes('job-i11'));
+    check('I11. runner/service 层去重：dup-1 去掉、仅 new-1 入账（newArticles=1）', getJobAccount('job-i11', 'i11-a').newArticles === 1);
+    check('I11. job=completed', getSyncJob('job-i11').status === 'completed');
+    // 诚实边界：本项只证 runner/service 层去重；生产 snapshot/export 端到端不重复属 C3-9，本片不宣称已闭环。
+  }
+
+  // ── I12 >500 running + fatal 前缀不饥饿（F-C3-5-P1）：520 个 running job、最新 20 个 fatal（保持 running）→
+  //     断言全部 520 个都被尝试恢复（无 500 上限静默截断）、最老的 job 仍被恢复。fix-must-fail (k) 精确变红点。
+  {
+    clearAllJobs();
+    const TOTAL = 520;
+    const OLD = 20;
+    const FATAL = 20;
+    const oldIds = [];
+    const fatalIds = [];
+    for (let i = 0; i < TOTAL; i += 1) {
+      const id = `i12-${String(i).padStart(3, '0')}`; // 建序即 created_at 近似升序（i 小=更老）
+      if (i < OLD) oldIds.push(id);
+      if (i >= TOTAL - FATAL) fatalIds.push(id); // 最后 20 个（最新）为 fatal
+      createSyncJob({ id, requestedSince: 1000, accounts: [{ fakeid: `${id}-a` }] });
+      jobs.startJob(id);
+      jobs.markAccountRunning(id, `${id}-a`);
+    }
+    const fatalSet = new Set(fatalIds);
+    const { fetchPage } = makeRoutingFetcher({}); // 未知 fakeid → 空文章 → succeeded
+    const summary = await runner.recoverInterruptedJobs({
+      fetchPage,
+      resolveOptions: (_acc, job) => { if (fatalSet.has(job.id)) throw new Error('fatal prefix'); return {}; },
+    });
+    const attempted = new Set([...summary.recovered, ...summary.cancelled, ...summary.failed.map((f) => f.jobId)]);
+    check('I12. 全部 520 个 running job 都被尝试恢复（无 500 上限静默截断，F-C3-5-P1）', attempted.size === TOTAL);
+    check('I12. 20 个 fatal（最新）job 进 summary.failed 且保持 running', summary.failed.length === FATAL && fatalIds.every((id) => summary.failed.some((f) => f.jobId === id) && getSyncJob(id).status === 'running'));
+    check('I12. 500 个非 fatal job 全 recovered', summary.recovered.length === TOTAL - FATAL);
+    check('I12. 20 个"最老" job 仍被恢复（未被 fatal 前缀遮住 → recovered）', oldIds.every((id) => summary.recovered.includes(id)));
+    check('I12. reconciled.jobs 统计到 520（全量快照，非截断 500）', summary.reconciled.jobs === TOTAL);
+  }
+
+  // ── I13 多 job fatal 连续不中断全局（N-C3-5-P2）：job A fatal → summary.failed 不阻断 job B 恢复 ──
+  {
+    clearAllJobs();
+    crashedJob('job-i13-A', ['i13a-x']); // 先建=更老，恢复顺序在前
+    crashedJob('job-i13-B', ['i13b-y']);
+    let bFetched = false;
+    const { fetchPage } = makeRoutingFetcher({
+      'i13b-y': () => { bFetched = true; return { articles: [article('y', 2000)], hasMore: false }; },
+    });
+    const summary = await runner.recoverInterruptedJobs({
+      fetchPage,
+      resolveOptions: (_acc, job) => { if (job.id === 'job-i13-A') throw new Error('job A fatal'); return {}; },
+    });
+    check('I13. job A fatal → summary.failed 含 A、job A 保持 running', summary.failed.some((f) => f.jobId === 'job-i13-A') && getSyncJob('job-i13-A').status === 'running');
+    check('I13. A 的 fatal 不阻断 B：B 的 fetcher 确被调用', bFetched === true);
+    check('I13. job B 正确 finalize=completed 且入 summary.recovered', getSyncJob('job-i13-B').status === 'completed' && summary.recovered.includes('job-i13-B'));
+  }
+
   console.log(`\nPASS smoke_mp_sync_runner: ${passed} assertions`);
 } catch (err) {
   console.error('FAIL smoke_mp_sync_runner:', err && err.stack ? err.stack : err);

@@ -226,6 +226,30 @@ export function listSyncJobs(options: { status?: MpSyncJobStatus; limit?: number
 }
 
 /**
+ * C3-5 重启恢复：枚举全部 status='running' 的 job id（无 LIMIT / 无游标 / 无 fatal 饥饿）。
+ * 一次性读取全部 running id 形成稳定快照；ORDER BY created_at ASC, id ASC = 全序确定性恢复顺序
+ * （created_at 由 nowIso() 毫秒级 new Date().toISOString() 生成、schema 仅 id 主键 + idempotency_key 唯一、
+ * created_at 无唯一约束可碰撞，加主键 id 并列键兜底全序，便于验收精确断言恢复次序）。
+ *
+ * **为何不用 listSyncJobs（不能用）**：listSyncJobs 的 limit 硬夹 1..500、created_at DESC LIMIT 无
+ * offset/cursor，结构上无法枚举全部 running job；且 C3-5 让 fatal job 保持 running，最新 500 个若持续
+ * fatal 会长踞第一页，更老的 running job 永不可见（饥饿）。「反复读第一页」也不解决——不改 job 状态就翻不了页，
+ * 改 job 状态翻页则违反「fatal 保持 running / 不伪装」。故新增本一次性稳定快照原语：单一时点捕获全部 running id，
+ * 不靠改 job 状态翻页，fatal job 保持 running 也不遮住任何其它 running job（同一快照同时捕获）。
+ *
+ * 仅在启动屏障 reconcileOrphanedJobs 完成后、任何新 runner admission 之前调用一次（单进程前提，见
+ * mp-sync-runner.ts recoverInterruptedJobs）；只 SELECT id 保持轻量；DB 异常原样上抛（fail-fast 整个恢复、
+ * 不静默漏 job）。多进程/多副本部署会破坏快照稳定性前提（属 OUT，需所有权租约独立切片）。
+ */
+export function listRunningJobIdsForRecovery(): string[] {
+  const db = getMpSyncDatabase();
+  const rows = db
+    .prepare(`SELECT id FROM mp_sync_jobs WHERE status = 'running' ORDER BY created_at ASC, id ASC`)
+    .all() as SqliteRow[];
+  return rows.map((r) => String(r.id));
+}
+
+/**
  * 创建同步任务并落盘账号快照。事务化：任务行 + 全部 job_account 行要么全写要么全不写。
  * 幂等键（idempotencyKey）已存在则直接返回既有任务，不重复创建（“重复 job 幂等”）。
  * 同一 job 内重复 fakeid 用 INSERT OR IGNORE 去重（“重复账号幂等”）。
@@ -555,6 +579,67 @@ export function resetFailedAccounts(jobId: string): number {
         `UPDATE mp_sync_job_accounts
          SET status = 'pending', error_code = NULL, error_message = NULL, finished_at = NULL, updated_at = ?
          WHERE job_id = ? AND status IN ('failed', 'auth_required')`
+      )
+      .run(now, jobId);
+    count = Number(result.changes ?? 0);
+    recomputeJobAggregates(db, jobId);
+    db.exec('COMMIT;');
+  } catch (error) {
+    db.exec('ROLLBACK;');
+    throw error;
+  }
+  return count;
+}
+
+/**
+ * C3-5 重启恢复原语：把该 job 的 interrupted 账号批量归一化为 pending，供 runner 复用既有 pool 续跑，
+ * 返回被改的账号数。与 resetFailedAccounts 对称（同为「把某源状态账号重置回 pending」），但只碰 interrupted
+ * 源、且**只改 status + updated_at**（字段最小化，见下）。runner 的 recoverOneJob 在 reset 后复用 runSyncJobPool
+ * 续跑（见 mp-sync-runner.ts）。沿用 resetFailedAccounts/cancelPendingAccounts 的 BEGIN IMMEDIATE 事务范式。
+ *
+ * **三道硬门 + 字段最小化，缺一 fail-closed 全回滚、账号与聚合逐字段不变**：
+ *   1. **P-R1 job 存在**：同一事务内 selectJob 读该 job，不存在 → 抛错 → ROLLBACK → 零变化。
+ *   2. **P-R2 job 状态门（单一事实源、不比状态机更宽）**：只允许 job.status==='running'。reconcileOrphanedJobs
+ *      与 C3-4 fatal 路径都让「待恢复」job 保持 running；completed/partial/failed/cancelled 是已终结事实、
+ *      queued 未启动（无 interrupted 账号），均不应恢复。校验与 UPDATE 在同一 BEGIN IMMEDIATE 内，无 TOCTOU。
+ *   3. **WHERE status='interrupted' 源状态硬门**：只碰 interrupted 源（interrupted->pending 合法），**绝不**
+ *      触及 pending / running / succeeded / failed / auth_required / cancelled（已完成/在飞/待重试/已取消账号
+ *      事实不被改）。
+ *   4. **字段最小化（只改 status + updated_at，对齐 reconcileOrphanedJobs 的降级写法）**：不清 started_at
+ *      （COALESCE 保留首次开始时间）、不清 retry_count（保留崩溃前重试历史供退避判断）、不动 page_cursor
+ *      （首版 startBegin=0、runner 不读它作 startBegin，保留无害）、**不动 error_code/error_message（无论 null
+ *      或非 null 一律逐字段原样保留）**。error_* 保留的正确依据：不能声称「interrupted 账号本就为 null」——
+ *      markAccountRunning 允许 failed/auth_required->running 且不清 error_*，故一个带非 null error_* 的账号
+ *      failed->running 重试→进程崩溃→reconcileOrphanedJobs 降级 running->interrupted，此时 interrupted 账号带
+ *      非 null error_* 是可达状态；reset 逐字段原样保留全部崩溃前事实（与 resetFailedAccounts 显式清 error_*
+ *      与 finished_at 的「干净可重试 pending」语义不同——本函数只做崩溃降级账号的状态归一化）。
+ *
+ * 聚合：interrupted/pending 都不计 succeeded/failed，故 recomputeJobAggregates 对计数是 no-op；仍调用以保持
+ * 事务一致 + 未来聚合口径变化不失真。幂等：job 仍 running 且已无 interrupted 时重复调 → changes=0、无副作用
+ * （仍过 P-R1/P-R2 门）。注意区分：恢复跑完 finalizeJob 后 job 变 completed/partial/cancelled（非 running），
+ * 此时再调会命中 P-R2 抛错——这是「已终态 job 不该恢复」的正确 fail-closed，不属幂等范畴。
+ */
+export function resetInterruptedAccounts(jobId: string): number {
+  const db = getMpSyncDatabase();
+  const now = nowIso();
+  let count = 0;
+  db.exec('BEGIN IMMEDIATE;');
+  try {
+    // ── 硬门 P-R1：job 必须存在 ──
+    const job = selectJob(db, jobId);
+    if (!job) throw new Error(`mp_sync_job not found: ${jobId}`);
+    // ── 硬门 P-R2：job 必须处于允许恢复的 'running' 状态（单一事实源，不比状态机更宽）──
+    if (job.status !== 'running') {
+      throw new Error(
+        `resetInterruptedAccounts requires job status 'running', got '${job.status}': ${jobId}`
+      );
+    }
+    // ── interrupted->pending 批量；WHERE status='interrupted' 源门只碰 interrupted、只改 status+updated_at ──
+    const result = db
+      .prepare(
+        `UPDATE mp_sync_job_accounts
+         SET status = 'pending', updated_at = ?
+         WHERE job_id = ? AND status = 'interrupted'`
       )
       .run(now, jobId);
     count = Number(result.changes ?? 0);
