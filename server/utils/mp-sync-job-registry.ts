@@ -470,7 +470,7 @@ export function isCancelRequested(jobId: string): boolean {
 /**
  * C3-4 协作式取消收口：把该 job 的 pending 账号批量落为 cancelled，返回被改的账号数。
  * runner 在停止调度新账号后调用（见 mp-sync-runner.ts runSyncJob/runSyncJobPool）。沿用
- * resetFailedAccounts/finalizeJob 的 BEGIN IMMEDIATE 事务范式。
+ * prepareFailedRetry/finalizeJob 的 BEGIN IMMEDIATE 事务范式。
  *
  * **两道硬门，缺一 fail-closed 全回滚、账号与聚合逐字段不变**：
  *   1. **job cancel 标记前置（P3 单一事实源）**：同一事务内 selectJob 读该 job，job 不存在或
@@ -565,15 +565,61 @@ export function finalizeJob(id: string): MpSyncJob {
 }
 
 /**
- * failed_only 重试准备：把 failed / auth_required 账号重置回 pending（清错误、保留 retry_count 作为退避依据）；
- * 任务从 partial/failed 迁回 running 由 runner（C3）负责。返回被重置的账号数。
+ * C3-6 failed_only 重试的**原子准备原语**（替换原 exported resetFailedAccounts）：在单个 BEGIN IMMEDIATE 内
+ * 「认领并准备重试」——四道权威门 + 把 job 从 partial|failed 迁 running（清 finished_at）+ 把 failed/auth_required
+ * 账号重置回 pending（清 error_*、保留 retry_count 作退避依据）+ 重算聚合，缺一 fail-closed 全回滚。返回迁移后的
+ * job 与被 reset 的账号数（供断言）。runner 的 retryFailedJob 在本原语提交后复用 runSyncJobPool 只重跑 pending
+ * （见 mp-sync-runner.ts）。沿用 cancelPendingAccounts/finalizeJob/resetInterruptedAccounts 的 BEGIN IMMEDIATE 事务范式。
+ *
+ * **四道硬门（全在同一事务内、任一迁移/reset 写入之前，缺一 fail-closed 全回滚、job/账号/聚合逐字段不变）**：
+ *   ① **存在门（P-RF1）**：selectJob 读该 job，不存在 → 抛 `mp_sync_job not found: <id>` → ROLLBACK → 零变化。
+ *   ② **源态硬门（P-RF2，迁移前 partial|failed）**：只允许 job.status ∈ {partial, failed}；running/completed/
+ *      queued/cancelled 一律抛 `job not retryable in status ...` → ROLLBACK。**门锚到迁移前源态、结构性拒绝活跃
+ *      running job**（活跃重跑中的 job 非 partial|failed），不依赖“唯一调用方”约定：failed/auth_required 账号与
+ *      活跃 pool 共存，仅检查 reset 时 status='running' 的更宽做法在 failed 源上不足以独立保证安全。
+ *   ③ **cancel 权威门**：读 job.cancelRequestedAt（selectJob 映射后的**驼峰**对象字段，对应 SQL 列 cancel_requested_at）；
+ *      非空 → 抛 `job has pending cancel request, not retryable: <id>` → ROLLBACK。与 cancelPendingAccounts P3 门同读
+ *      同列、同在事务内，无 TOCTOU；cancel 严格优先于重试（不复活已请求取消的 job）。**绝不写 job.cancel_requested_at**
+ *      （MpSyncJob 对象无此 snake_case 属性、恒 undefined → 门静默失效）；snake_case 只出现在 SQL 列名与错误文案。
+ *   ④ **assertJobTransition 防御性再断言**：partial|failed → running 合法（JOB_TRANSITIONS 已保证，门② 通过后恒真），
+ *      冗余断言防未来状态机改动悄悄放宽。
+ *
+ * 迁移 + reset 内联在同一事务（startJob 无自身 BEGIN IMMEDIATE、不可嵌进本事务，故此处内联等价迁移 SQL，不复用
+ * startJob 函数体）：
+ *   - job partial|failed → running，started_at COALESCE 保留、finished_at 清空（重跑不再是“已完成”，与 startJob 一致）。
+ *   - failed/auth_required 账号 → pending，清 error_code/error_message/finished_at、**保留 retry_count**（退避依据）；
+ *     WHERE 源门只碰 failed/auth_required，绝不触 pending/running/succeeded/interrupted/cancelled。
+ *   - recomputeJobAggregates 从账号真值重算。
+ *
+ * **原子性**：① 同 job 两次 prepareFailedRetry 只一个获胜——第二个拿锁后 selectJob 见 running、门② 在任何写入前
+ * fail-closed；② 任一门/SQL/聚合抛错整体回滚，绝不留“running 但未 reset”半状态；③ 提交后至少是 running + pending
+ * 的完整可执行态。**幂等边界**：job 被认领跑到终态后重复调 → 门② 命中（非 partial|failed）抛错 fail-closed（是“已终态
+ * 不该再认领”的正确拒绝、非 no-op；与 resetInterruptedAccounts 已终态 fail-closed 同理）。
  */
-export function resetFailedAccounts(jobId: string): number {
+export function prepareFailedRetry(jobId: string): { job: MpSyncJob; reset: number } {
   const db = getMpSyncDatabase();
   const now = nowIso();
-  let count = 0;
+  let reset = 0;
   db.exec('BEGIN IMMEDIATE;');
   try {
+    // ── 门① 存在（P-RF1） ──
+    const job = selectJob(db, jobId);
+    if (!job) throw new Error(`mp_sync_job not found: ${jobId}`);
+    // ── 门② 源态硬门（迁移前 partial|failed；结构性拒绝活跃 running / 已终结 / 未启动 job） ──
+    if (job.status !== 'partial' && job.status !== 'failed') {
+      throw new Error(`job not retryable in status '${job.status}': ${jobId}`);
+    }
+    // ── 门③ cancel 权威门（读驼峰对象字段 = SQL 列 cancel_requested_at；cancel 严格优先，无 TOCTOU） ──
+    if (job.cancelRequestedAt != null) {
+      throw new Error(`job has pending cancel request, not retryable: ${jobId}`);
+    }
+    // ── 门④ assertJobTransition 防御性再断言（partial|failed -> running 合法） ──
+    assertJobTransition(job.status, 'running');
+    // ── 迁移 job partial|failed -> running（清 finished_at，与 startJob 语义一致） ──
+    db.prepare(
+      'UPDATE mp_sync_jobs SET status = ?, started_at = COALESCE(started_at, ?), finished_at = NULL WHERE id = ?'
+    ).run('running', now, jobId);
+    // ── reset failed/auth_required -> pending（清 error_*/finished_at、保留 retry_count） ──
     const result = db
       .prepare(
         `UPDATE mp_sync_job_accounts
@@ -581,21 +627,21 @@ export function resetFailedAccounts(jobId: string): number {
          WHERE job_id = ? AND status IN ('failed', 'auth_required')`
       )
       .run(now, jobId);
-    count = Number(result.changes ?? 0);
+    reset = Number(result.changes ?? 0);
     recomputeJobAggregates(db, jobId);
     db.exec('COMMIT;');
   } catch (error) {
     db.exec('ROLLBACK;');
     throw error;
   }
-  return count;
+  return { job: selectJob(db, jobId) as MpSyncJob, reset };
 }
 
 /**
  * C3-5 重启恢复原语：把该 job 的 interrupted 账号批量归一化为 pending，供 runner 复用既有 pool 续跑，
- * 返回被改的账号数。与 resetFailedAccounts 对称（同为「把某源状态账号重置回 pending」），但只碰 interrupted
+ * 返回被改的账号数。与 prepareFailedRetry 对称（同为「把某源状态账号重置回 pending」），但只碰 interrupted
  * 源、且**只改 status + updated_at**（字段最小化，见下）。runner 的 recoverOneJob 在 reset 后复用 runSyncJobPool
- * 续跑（见 mp-sync-runner.ts）。沿用 resetFailedAccounts/cancelPendingAccounts 的 BEGIN IMMEDIATE 事务范式。
+ * 续跑（见 mp-sync-runner.ts）。沿用 prepareFailedRetry/cancelPendingAccounts 的 BEGIN IMMEDIATE 事务范式。
  *
  * **三道硬门 + 字段最小化，缺一 fail-closed 全回滚、账号与聚合逐字段不变**：
  *   1. **P-R1 job 存在**：同一事务内 selectJob 读该 job，不存在 → 抛错 → ROLLBACK → 零变化。
@@ -611,7 +657,7 @@ export function resetFailedAccounts(jobId: string): number {
  *      或非 null 一律逐字段原样保留）**。error_* 保留的正确依据：不能声称「interrupted 账号本就为 null」——
  *      markAccountRunning 允许 failed/auth_required->running 且不清 error_*，故一个带非 null error_* 的账号
  *      failed->running 重试→进程崩溃→reconcileOrphanedJobs 降级 running->interrupted，此时 interrupted 账号带
- *      非 null error_* 是可达状态；reset 逐字段原样保留全部崩溃前事实（与 resetFailedAccounts 显式清 error_*
+ *      非 null error_* 是可达状态；reset 逐字段原样保留全部崩溃前事实（与 prepareFailedRetry 显式清 error_*
  *      与 finished_at 的「干净可重试 pending」语义不同——本函数只做崩溃降级账号的状态归一化）。
  *
  * 聚合：interrupted/pending 都不计 succeeded/failed，故 recomputeJobAggregates 对计数是 no-op；仍调用以保持

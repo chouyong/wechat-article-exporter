@@ -38,7 +38,7 @@ const runner = await import('../server/utils/mp-sync-runner.ts');
 
 const { createSyncJob, getSyncJob, getJobAccount } = jobs;
 const { SyncConfigError, isRetryableErrorKind } = service;
-const { runSyncJob, runSyncJobPool, classifyAccountResult, ConcurrencyController } = runner;
+const { runSyncJob, runSyncJobPool, retryFailedJob, classifyAccountResult, ConcurrencyController } = runner;
 const {
   ClockAbortError,
   createRealClock,
@@ -1817,6 +1817,206 @@ try {
     check('I13. job A fatal → summary.failed 含 A、job A 保持 running', summary.failed.some((f) => f.jobId === 'job-i13-A') && getSyncJob('job-i13-A').status === 'running');
     check('I13. A 的 fatal 不阻断 B：B 的 fetcher 确被调用', bFetched === true);
     check('I13. job B 正确 finalize=completed 且入 summary.recovered', getSyncJob('job-i13-B').status === 'completed' && summary.recovered.includes('job-i13-B'));
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // K 段（C3-6 failed_only 重试编排 retryFailedJob，方案 §3.2）
+  //   K1 happy 双断言（succeeded 零 fetch + 行不变）/ K2 still-fail（retry_count 单调）/
+  //   K-invalid-deps（入口非法零 DB 写）/ K-deps-drift（提交后漂移 inert，用入口快照跑完）/
+  //   K-entry 门（completed/queued/running → 门② 抛）/ K-cancel 严格优先（快速探针）/
+  //   K-TOCTOU（探针 false + 真库列 set → 门③ 权威拒绝）/ K-mid-cancel（pool 收口 cancelled）/
+  //   K-auth（凭据仍无效 / 已恢复 两语义）。
+  //
+  // C3-6 fix-must-fail 分布（(a)-(i) 每条绑唯一不变量、破坏后精确首红、还原真绿）：
+  //   (a) 删门② → jobs smoke J2；(b) 删门① → jobs smoke J1；(c) 删门③ → jobs smoke J3；(f) 拆两事务 → jobs smoke J6；
+  //   (d) resolveRetryContext 移到 prepare 之后 → 本段 K-invalid-deps「零 DB 写」红；
+  //   (e) cancel 权威门移出事务 → 本段 K-TOCTOU「探针 false 仍拒」红；
+  //   (g) reset 源门误加 succeeded → 本段 K1「succeeded 零 fetch/行不变」红；
+  //   (h) retryFailedJob 返回 prepareFailedRetry 缓存旧 job → 本段 K-mid-cancel「job.status=cancelled」红；
+  //   (i) retryFailedJob 丢弃入口 ctx、改调公开 runSyncJobPool(jobId,deps) → 本段 K-deps-drift「不抛 RangeError」红。
+  //   隔离：每块 clearAllJobs()（同 I 段），避免历史 running job 干扰。
+
+  // K 段 helper：跑一轮 pool 到指定终态（succIds 成功、failIds 失败(api_error)）；用于播种 partial|failed 供 retry。
+  async function seedViaPool(jobId, succIds, failIds) {
+    clearAllJobs();
+    const ids = [...succIds, ...failIds];
+    createSyncJob({ id: jobId, requestedSince: 1000, accounts: ids.map((f, i) => ({ fakeid: f, priority: 100 - i })) });
+    const spec = {};
+    for (const f of failIds) spec[f] = { throwStatus: 500 }; // → failed(api_error)
+    const fc = makeConcurrentFetcher(spec);
+    return runSyncJobPool(jobId, { fetchPage: fc.fetchPage }, { healthyStreakToRaise: 100000 });
+  }
+  const okFetcher = () => makeRoutingFetcher({}).fetchPage; // 用于必在门前抛错、不会真正 fetch 的用例
+
+  // ── K1 happy 双断言：retry 只重跑 failed；succeeded 零 fetch + 行不变（C3-6 fix-must-fail (g)）──
+  {
+    const run1 = await seedViaPool('job-k1', ['k1-s'], ['k1-f1', 'k1-f2']);
+    check('K1-pre. 首轮 → partial（1 succeeded + 2 failed）', run1.job.status === 'partial');
+    const sBefore = JSON.stringify(getJobAccount('job-k1', 'k1-s'));
+    const retryFc = makeRoutingFetcher({
+      'k1-f1': () => ({ articles: [article('r1', 2000)], hasMore: false }),
+      'k1-f2': () => ({ articles: [article('r2', 2000)], hasMore: false }),
+      'k1-s': () => { throw new Error('已 succeeded 账号不应被 retry fetch（K-happy 双断言）'); },
+    });
+    const res = await retryFailedJob('job-k1', { fetchPage: retryFc.fetchPage });
+    check('K1. retry 只重跑 2 failed → 均 succeeded',
+      ['k1-f1', 'k1-f2'].every((f) => getJobAccount('job-k1', f).status === 'succeeded'));
+    check('K1. succeeded 账号零 fetch（fetcher 从未收到 k1-s；fix-must-fail (g)）', (retryFc.calls['k1-s'] ?? 0) === 0);
+    check('K1. succeeded 账号逐字段不变（未被二次抓取/改写）', JSON.stringify(getJobAccount('job-k1', 'k1-s')) === sBefore);
+    check('K1. 2 failed 账号各被 retry fetch 1 次', retryFc.calls['k1-f1'] === 1 && retryFc.calls['k1-f2'] === 1);
+    check('K1. job → completed', res.job.status === 'completed');
+  }
+
+  // ── K2 still-fail：retry 后仍 failed → partial/failed；retry_count 单调 +1 ──
+  {
+    const run1 = await seedViaPool('job-k2', ['k2-s'], ['k2-f']);
+    check('K2-pre. 首轮 → partial', run1.job.status === 'partial');
+    const rcBefore = getJobAccount('job-k2', 'k2-f').retryCount;
+    const retryFc = makeConcurrentFetcher({ 'k2-f': { throwStatus: 500 } });
+    const res = await retryFailedJob('job-k2', { fetchPage: retryFc.fetchPage });
+    check('K2. retry 后仍 failed → job partial（k2-s succeeded）', res.job.status === 'partial');
+    check('K2. 失败账号 retry_count 单调 +1', getJobAccount('job-k2', 'k2-f').retryCount === rcBefore + 1);
+  }
+
+  // ── K-invalid-deps：入口即非法 deps → 抛 RangeError、零 DB 写（C3-6 fix-must-fail (d)）──
+  {
+    await seedViaPool('job-k3', ['k3-s'], ['k3-f']);
+    const jobBefore = JSON.stringify(getSyncJob('job-k3'));
+    const fBefore = JSON.stringify(getJobAccount('job-k3', 'k3-f'));
+    const retryFc = makeRoutingFetcher({ 'k3-f': () => ({ articles: [article('x', 2000)], hasMore: false }) });
+    let err;
+    try { await retryFailedJob('job-k3', { fetchPage: retryFc.fetchPage, retry: { maxAttempts: 0 } }); } catch (e) { err = e; }
+    check('K-invalid-deps. 入口非法 deps → 抛 RangeError（fix-must-fail (d)）', err instanceof RangeError);
+    check('K-invalid-deps. job 逐字段不变（prepareFailedRetry 未执行、校验前置于首次 DB 写）',
+      JSON.stringify(getSyncJob('job-k3')) === jobBefore);
+    check('K-invalid-deps. failed 账号逐字段不变（未被 reset 成 pending）',
+      JSON.stringify(getJobAccount('job-k3', 'k3-f')) === fBefore);
+    check('K-invalid-deps. fetchPage 零调用（重跑未发生）', (retryFc.calls['k3-f'] ?? 0) === 0);
+  }
+
+  // ── K-deps-drift：入口合法但提交后探针改写原始 deps → 用入口已验证快照跑完、绝不抛 RangeError（C3-6 fix-must-fail (i)）──
+  {
+    await seedViaPool('job-k4', ['k4-s'], ['k4-f']);
+    const retryFc = makeRoutingFetcher({ 'k4-f': () => ({ articles: [article('x', 2000)], hasMore: false }) });
+    const deps = { fetchPage: retryFc.fetchPage, retry: { maxAttempts: 1 } };
+    let drifted = false;
+    deps.isCancelRequested = () => {
+      // 首次调用（retryFailedJob 事务外快速探针）把原始 deps.retry.maxAttempts 改 0 并返回 false（谎报无 cancel）。
+      if (!drifted) { drifted = true; deps.retry.maxAttempts = 0; }
+      return false;
+    };
+    let err;
+    let res;
+    try { res = await retryFailedJob('job-k4', deps); } catch (e) { err = e; }
+    check('K-deps-drift. 用入口已验证快照跑完、不抛 RangeError（fix-must-fail (i)）', err === undefined);
+    check('K-deps-drift. 探针确已改写原始 deps.retry.maxAttempts=0（漂移已发生）', deps.retry.maxAttempts === 0);
+    check('K-deps-drift. 重跑确实发生（failed 账号按入口 ctx 被 fetch）', (retryFc.calls['k4-f'] ?? 0) >= 1);
+    check('K-deps-drift. job 达合法终态 completed（无 running+pending 半状态）', res && res.job.status === 'completed');
+    check('K-deps-drift. failed 账号 → succeeded（入口快照跑完）', getJobAccount('job-k4', 'k4-f').status === 'succeeded');
+  }
+
+  // ── K-entry 门：completed / queued / running job → retryFailedJob 由 prepareFailedRetry 门② 抛 not retryable ──
+  {
+    // completed
+    const runC = await seedViaPool('job-k5c', ['k5c-a'], []);
+    check('K5-completed. 前置 → completed', runC.job.status === 'completed');
+    let errC; try { await retryFailedJob('job-k5c', { fetchPage: okFetcher() }); } catch (e) { errC = e; }
+    check('K5-completed. completed job retry → 门② 抛 not retryable',
+      errC instanceof Error && /not retryable in status 'completed'/.test(errC.message));
+    // queued（未 startJob）
+    clearAllJobs();
+    createSyncJob({ id: 'job-k5q', requestedSince: 1000, accounts: [{ fakeid: 'k5q-a' }] });
+    let errQ; try { await retryFailedJob('job-k5q', { fetchPage: okFetcher() }); } catch (e) { errQ = e; }
+    check('K5-queued. queued job retry → 门② 抛 not retryable',
+      errQ instanceof Error && /not retryable in status 'queued'/.test(errQ.message));
+    check('K5-queued. 账号仍 pending（未触迁移）', getJobAccount('job-k5q', 'k5q-a').status === 'pending');
+    // running（startJob 后不 finalize）
+    clearAllJobs();
+    createSyncJob({ id: 'job-k5r', requestedSince: 1000, accounts: [{ fakeid: 'k5r-a' }] });
+    jobs.startJob('job-k5r');
+    let errR; try { await retryFailedJob('job-k5r', { fetchPage: okFetcher() }); } catch (e) { errR = e; }
+    check('K5-running. running job retry → 门② 抛 not retryable',
+      errR instanceof Error && /not retryable in status 'running'/.test(errR.message));
+  }
+
+  // ── K-cancel 严格优先：cancel-requested partial → 事务外快速探针命中即拒、零 fetch、不复活 ──
+  {
+    await seedViaPool('job-k6', ['k6-s'], ['k6-f']);
+    jobs.requestCancel('job-k6'); // partial + cancel_requested_at set
+    const jobBefore = JSON.stringify(getSyncJob('job-k6'));
+    const fBefore = JSON.stringify(getJobAccount('job-k6', 'k6-f'));
+    const retryFc = makeRoutingFetcher({ 'k6-f': () => { throw new Error('cancel 优先，不应 fetch'); } });
+    let err;
+    try { await retryFailedJob('job-k6', { fetchPage: retryFc.fetchPage, isCancelRequested: (jid) => jobs.isCancelRequested(jid) }); } catch (e) { err = e; }
+    check('K6. cancel-requested partial retry → 抛 pending cancel（不复活）',
+      err instanceof Error && /pending cancel request, not retryable/.test(err.message));
+    check('K6. 零 fetch + job/账号逐字段不变',
+      (retryFc.calls['k6-f'] ?? 0) === 0 &&
+      JSON.stringify(getSyncJob('job-k6')) === jobBefore &&
+      JSON.stringify(getJobAccount('job-k6', 'k6-f')) === fBefore);
+  }
+
+  // ── K-TOCTOU：事务外快速探针谎报 false，但真库 cancel 列已 set → prepareFailedRetry 门③ 读列真值仍拒绝（C3-6 fix-must-fail (e)）──
+  {
+    await seedViaPool('job-k7', ['k7-s'], ['k7-f']);
+    jobs.requestCancel('job-k7'); // 真库 cancel_requested_at set（partial→cancelled 合法）
+    const jobBefore = JSON.stringify(getSyncJob('job-k7'));
+    const fBefore = JSON.stringify(getJobAccount('job-k7', 'k7-f'));
+    const retryFc = makeRoutingFetcher({ 'k7-f': () => { throw new Error('cancel，不应 fetch'); } });
+    let err;
+    // 注入探针恒返回 false（谎报无 cancel）：quick 探针放行 → 权威门③（事务内读列）仍拒绝。
+    try { await retryFailedJob('job-k7', { fetchPage: retryFc.fetchPage, isCancelRequested: () => false }); } catch (e) { err = e; }
+    check('K7-TOCTOU. 探针谎报 false 但真库 cancel 列已 set → 门③ 读列真值仍拒绝（fix-must-fail (e)）',
+      err instanceof Error && /pending cancel request, not retryable/.test(err.message));
+    check('K7-TOCTOU. 零 fetch + job/账号逐字段不变（未被认领）',
+      (retryFc.calls['k7-f'] ?? 0) === 0 &&
+      JSON.stringify(getSyncJob('job-k7')) === jobBefore &&
+      JSON.stringify(getJobAccount('job-k7', 'k7-f')) === fBefore);
+  }
+
+  // ── K-mid-cancel：retry 认领后 pool 内观察到 cancel → 正常 resolve、返回 pool final job.status=cancelled（C3-6 fix-must-fail (h)）──
+  {
+    await seedViaPool('job-k8', ['k8-s'], ['k8-f1', 'k8-f2']);
+    check('K8-pre. 前置 → partial（2 failed）', getSyncJob('job-k8').status === 'partial');
+    let probeCalls = 0;
+    const probe = (jid) => {
+      probeCalls += 1;
+      // #1 = retryFailedJob 事务外快速探针（此刻真库无 cancel → 门③ 过）；#2 = pool 首次 pump → 真实 requestCancel（建持久标记满足 P3）后 true → 收口 cancelled。
+      if (probeCalls === 2) jobs.requestCancel(jid);
+      return probeCalls >= 2 ? jobs.isCancelRequested(jid) : false;
+    };
+    const retryFc = makeConcurrentFetcher({ 'k8-f1': { delayMs: 10 }, 'k8-f2': { delayMs: 10 } });
+    const res = await retryFailedJob('job-k8', { fetchPage: retryFc.fetchPage, isCancelRequested: probe });
+    check('K8. mid-retry cancel → pool 正常 resolve、返回 job.status=cancelled（fix-must-fail (h)：返回缓存旧 job 则此断言红）',
+      res.job.status === 'cancelled');
+    check('K8. job 落定 cancelled（finalizeJob 收口）', getSyncJob('job-k8').status === 'cancelled');
+  }
+
+  // ── K-auth：auth_required 显式 retry 两语义（P1）──
+  {
+    // (1) 凭据仍无效：auth_required 账号 retry 后仍 auth_required（单次 fetch、retry_count+1、非后台反复重试）
+    clearAllJobs();
+    createSyncJob({ id: 'job-k9', requestedSince: 1000, accounts: [{ fakeid: 'k9-s' }, { fakeid: 'k9-auth' }] });
+    const r1fc = makeConcurrentFetcher({ 'k9-auth': { throwStatus: 401 } });
+    const r1 = await runSyncJobPool('job-k9', { fetchPage: r1fc.fetchPage }, { healthyStreakToRaise: 100000 });
+    check('K9-pre. 首轮 → partial（k9-s succeeded + k9-auth auth_required）',
+      r1.job.status === 'partial' && getJobAccount('job-k9', 'k9-auth').status === 'auth_required');
+    const rcBefore = getJobAccount('job-k9', 'k9-auth').retryCount;
+    const retryFc1 = makeRoutingFetcher({
+      'k9-auth': () => { const e = new Error('http 401'); e.status = 401; throw e; }, // 凭据仍无效
+      'k9-s': () => { throw new Error('succeeded 不应被 fetch'); },
+    });
+    const res1 = await retryFailedJob('job-k9', { fetchPage: retryFc1.fetchPage, retry: { maxAttempts: 5 } });
+    check('K9-still-invalid. retry 后仍 auth_required', getJobAccount('job-k9', 'k9-auth').status === 'auth_required');
+    check('K9-still-invalid. 单次 fetch（auth_required 不进退避重试，即便 maxAttempts=5）', retryFc1.calls['k9-auth'] === 1);
+    check('K9-still-invalid. retry_count 单调 +1', getJobAccount('job-k9', 'k9-auth').retryCount === rcBefore + 1);
+    check('K9-still-invalid. succeeded 账号零 fetch', (retryFc1.calls['k9-s'] ?? 0) === 0);
+    check('K9-still-invalid. job → partial（k9-s succeeded）', res1.job.status === 'partial');
+    // (2) 模拟凭据恢复：同账号 retry 后 succeeded
+    const retryFc2 = makeRoutingFetcher({ 'k9-auth': () => ({ articles: [article('ok', 2000)], hasMore: false }) });
+    const res2 = await retryFailedJob('job-k9', { fetchPage: retryFc2.fetchPage });
+    check('K9-recovered. 凭据恢复 → k9-auth succeeded', getJobAccount('job-k9', 'k9-auth').status === 'succeeded');
+    check('K9-recovered. job → completed', res2.job.status === 'completed');
   }
 
   console.log(`\nPASS smoke_mp_sync_runner: ${passed} assertions`);

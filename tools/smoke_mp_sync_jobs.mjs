@@ -128,11 +128,16 @@ try {
   check('7. 回滚后 job-dup 账号数不变（无半条写入）', jobs.listJobAccounts('job-dup').length === beforeAcc);
   check('7. 回滚后 zzz 未落库', jobs.getJobAccount('job-dup', 'zzz') === null);
 
-  // ── 8. failed_only 重置：failed/auth_required -> pending，retry_count 保留 ─
+  // ── 8. failed_only 原子准备 prepareFailedRetry：partial|failed job -> running + failed/auth_required 账号 -> pending，retry_count 保留 ─
+  //   （原 exported resetFailedAccounts 已被原子原语 prepareFailedRetry 取代；后者门② 要求源态 partial|failed，
+  //    故先 finalize 到 partial 再原子认领——迁 running + reset 在同一 BEGIN IMMEDIATE 内。）
   jobs.markAccountRunning('job-1', 'acc-c');
   jobs.applyAccountOutcome('job-1', 'acc-c', { status: 'auth_required', errorCode: 'auth' });
-  const resetN = jobs.resetFailedAccounts('job-1');
-  check('8. 重置账号数=2（failed + auth_required）', resetN === 2);
+  const j1pre = jobs.finalizeJob('job-1'); // 1 succeeded + 1 failed + 1 auth_required -> partial
+  check('8. 预置：finalize -> partial（供 prepareFailedRetry 门② 源态）', j1pre.status === 'partial');
+  const prep8 = jobs.prepareFailedRetry('job-1');
+  check('8. 重置账号数=2（failed + auth_required）', prep8.reset === 2);
+  check('8. 原语迁 job partial -> running', prep8.job.status === 'running');
   const accBReset = jobs.getJobAccount('job-1', 'acc-b');
   check('8. acc-b 回到 pending', accBReset.status === 'pending');
   check('8. retry_count 保留=1（供退避）', accBReset.retryCount === 1);
@@ -210,14 +215,14 @@ try {
     '13. 首次 finalize -> partial 且有 finished_at',
     firstFinal.status === 'partial' && firstFinal.finishedAt !== null
   );
-  jobs.resetFailedAccounts('job-retry-ts');
-  const rerun = jobs.startJob('job-retry-ts'); // partial -> running，清 finished_at
-  check('13. 重跑 startJob 清空 finished_at（不再是已完成）', rerun.finishedAt === null);
+  const prep13 = jobs.prepareFailedRetry('job-retry-ts'); // partial -> running + reset acc-q，一步清 finished_at
+  check('13. prepareFailedRetry 迁 partial -> running', prep13.job.status === 'running');
+  check('13. 重跑清空 finished_at（不再是已完成）', prep13.job.finishedAt === null);
   jobs.markAccountRunning('job-retry-ts', 'q');
   jobs.applyAccountOutcome('job-retry-ts', 'q', { status: 'succeeded' });
   const reFinal = jobs.finalizeJob('job-retry-ts');
   check('13. 重试后 re-finalize -> completed', reFinal.status === 'completed');
-  // 核心 fix-must-fail 在上一句「rerun.finishedAt === null」：无 startJob 清空则此处仍是首次陈旧值。
+  // 核心 fix-must-fail 在上一句「prep13.job.finishedAt === null」：无 prepareFailedRetry 迁移清空则此处仍是首次陈旧值。
   // 经 NULL 后 COALESCE(NULL, now) 必写新鲜值，故只断言非 null（不比较字符串，避免同毫秒 flaky）。
   check('13. re-finalize 写入新鲜 finished_at（经 NULL 后重置）', reFinal.finishedAt !== null);
 
@@ -678,6 +683,216 @@ try {
       jobAfter.processedAccounts === jobBefore.processedAccounts);
     // 还原后 reset 正常工作（证明 db.prepare 已复原、无残留副作用）
     check('H6. 还原后 reset 正常 count=2', jobs.resetInterruptedAccounts('job-h6') === 2);
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // C3-6 failed_only 重试原子原语 prepareFailedRetry（方案 §3.1 J 段）
+  //   J1 门① 存在：missing → 精确 not-found 消息 + 零副作用（绑 fix-must-fail (b)：删门① 由下游 job.status
+  //      解引用改抛 TypeError（消息不符约定）→ 门① 精确 fixture 变红，不因“仍抛某错”保持绿）
+  //   J2 门② 源态硬门：running/completed/queued/cancelled → 抛 not retryable + 逐字段零变化（绑 (a)）
+  //   J3 门③ cancel 权威：读 job.cancelRequestedAt 驼峰字段；partial-requestCancel 公共可达 + failed raw-row
+  //      防御态（failed→cancelled 经 requestCancel 不可达）→ 均抛 pending cancel（绑 (c)）
+  //   J4 happy 原子迁移 + reset：partial|failed → running；failed/auth_required→pending 清 error_*/保留 retry_count；
+  //      succeeded/pending 深等值不变；聚合正确
+  //   J5 认领互斥：同 job 连调两次 → 第一次胜、第二次门② fail-closed 零二次变化
+  //   J6 原子回滚（半状态不可达）：注入 reset 账号 UPDATE 失败 → job 仍 partial、迁移 UPDATE 一并撤销（绑 (f)）
+  //   注：(e) TOCTOU（事务外探针 false + 真库列 set）与 (d)/(g)/(h)/(i) 在 runner K 段（探针/ctx/pool 在那层）。
+  //   复用既有 snap15 深快照 helper（L317）。
+
+  // 验消息 helper：断言抛出 Error 且消息匹配正则（门① 精确 not-found，防被下游 TypeError 遮蔽）。
+  function throwsMatch(desc, fn, re) {
+    let err;
+    try { fn(); } catch (e) { err = e; }
+    check(desc, err instanceof Error && re.test(err.message));
+  }
+
+  // 构造可重试 job：partial = 1 succeeded + 1 failed + 1 auth_required + 1 pending（失败隔离残留）；
+  //   failed = 1 failed + 1 auth_required（无 succeeded/无 pending）。finalize 到目标态供 prepareFailedRetry 门②。
+  function seedRetryableJob(id, { statusTarget = 'partial' } = {}) {
+    if (statusTarget === 'failed') {
+      jobs.createSyncJob({ id, accounts: [{ fakeid: 'f1' }, { fakeid: 'a1' }] });
+      jobs.startJob(id);
+      jobs.markAccountRunning(id, 'f1');
+      jobs.applyAccountOutcome(id, 'f1', { status: 'failed', errorCode: 'timeout', errorMessage: 'boom' });
+      jobs.markAccountRunning(id, 'a1');
+      jobs.applyAccountOutcome(id, 'a1', { status: 'auth_required', errorCode: 'auth' });
+      const j = jobs.finalizeJob(id);
+      check(`J-seed(${id}). finalize -> failed`, j.status === 'failed');
+      return j;
+    }
+    jobs.createSyncJob({ id, accounts: [{ fakeid: 's1' }, { fakeid: 'f1' }, { fakeid: 'a1' }, { fakeid: 'p1' }] });
+    jobs.startJob(id);
+    jobs.markAccountRunning(id, 's1');
+    jobs.applyAccountOutcome(id, 's1', { status: 'succeeded', newArticles: 3, pageCursor: 20, lastArticleTime: 111 });
+    jobs.markAccountRunning(id, 'f1');
+    jobs.applyAccountOutcome(id, 'f1', { status: 'failed', errorCode: 'timeout', errorMessage: 'boom' });
+    jobs.markAccountRunning(id, 'a1');
+    jobs.applyAccountOutcome(id, 'a1', { status: 'auth_required', errorCode: 'auth' });
+    const j = jobs.finalizeJob(id); // succeeded=1 + failed=2 (+ 残留 pending p1) -> partial
+    check(`J-seed(${id}). finalize -> partial`, j.status === 'partial');
+    return j;
+  }
+
+  // ── J1 门① 存在（P-RF1）：missing → 精确 not-found 消息 + 零副作用（fix-must-fail (b)）──
+  throwsMatch('J1. prepareFailedRetry(missing) 抛精确 mp_sync_job not found 消息',
+    () => jobs.prepareFailedRetry('job-j1-missing'), /mp_sync_job not found: job-j1-missing/);
+  check('J1. missing job 仍不存在（零副作用）', jobs.getSyncJob('job-j1-missing') === null);
+
+  // ── J2 门② 源态硬门（迁移前 partial|failed；fix-must-fail (a)）──
+  {
+    // running（startJob 后）
+    jobs.createSyncJob({ id: 'job-j2-run', accounts: [{ fakeid: 'r1' }] });
+    jobs.startJob('job-j2-run');
+    const j2rJob = JSON.stringify(jobs.getSyncJob('job-j2-run'));
+    const j2rAcc = snap15('job-j2-run', 'r1');
+    throwsMatch('J2-running. running job → 门② 抛 not retryable',
+      () => jobs.prepareFailedRetry('job-j2-run'), /not retryable in status 'running'/);
+    check('J2-running. 逐字段零变化',
+      JSON.stringify(jobs.getSyncJob('job-j2-run')) === j2rJob && snap15('job-j2-run', 'r1') === j2rAcc);
+    // queued（未 startJob）
+    jobs.createSyncJob({ id: 'job-j2-q', accounts: [{ fakeid: 'q1' }] });
+    const j2qJob = JSON.stringify(jobs.getSyncJob('job-j2-q'));
+    const j2qAcc = snap15('job-j2-q', 'q1');
+    throwsMatch('J2-queued. queued job → 门② 抛 not retryable',
+      () => jobs.prepareFailedRetry('job-j2-q'), /not retryable in status 'queued'/);
+    check('J2-queued. 逐字段零变化',
+      JSON.stringify(jobs.getSyncJob('job-j2-q')) === j2qJob && snap15('job-j2-q', 'q1') === j2qAcc);
+    // completed
+    jobs.createSyncJob({ id: 'job-j2-c', accounts: [{ fakeid: 'c1' }] });
+    jobs.startJob('job-j2-c');
+    jobs.markAccountRunning('job-j2-c', 'c1');
+    jobs.applyAccountOutcome('job-j2-c', 'c1', { status: 'succeeded', newArticles: 1 });
+    check('J2-completed. 前置 → completed', jobs.finalizeJob('job-j2-c').status === 'completed');
+    const j2cJob = JSON.stringify(jobs.getSyncJob('job-j2-c'));
+    const j2cAcc = snap15('job-j2-c', 'c1');
+    throwsMatch('J2-completed. completed job → 门② 抛 not retryable',
+      () => jobs.prepareFailedRetry('job-j2-c'), /not retryable in status 'completed'/);
+    check('J2-completed. 逐字段零变化',
+      JSON.stringify(jobs.getSyncJob('job-j2-c')) === j2cJob && snap15('job-j2-c', 'c1') === j2cAcc);
+    // cancelled（门② 先于门③ 命中，抛 status 'cancelled'）
+    jobs.createSyncJob({ id: 'job-j2-x', accounts: [{ fakeid: 'x1' }] });
+    jobs.startJob('job-j2-x');
+    jobs.requestCancel('job-j2-x');
+    check('J2-cancelled. 前置 → cancelled', jobs.finalizeJob('job-j2-x').status === 'cancelled');
+    const j2xJob = JSON.stringify(jobs.getSyncJob('job-j2-x'));
+    const j2xAcc = snap15('job-j2-x', 'x1');
+    throwsMatch('J2-cancelled. cancelled job → 门② 抛 not retryable',
+      () => jobs.prepareFailedRetry('job-j2-x'), /not retryable in status 'cancelled'/);
+    check('J2-cancelled. 逐字段零变化',
+      JSON.stringify(jobs.getSyncJob('job-j2-x')) === j2xJob && snap15('job-j2-x', 'x1') === j2xAcc);
+  }
+
+  // ── J3 门③ cancel 权威门（读 job.cancelRequestedAt 驼峰字段；fix-must-fail (c)）──
+  {
+    // (1) 公共 API 可达：partial job 经 requestCancel（partial→cancelled 合法）打 cancel_requested_at（status 仍 partial）
+    seedRetryableJob('job-j3-partial');
+    jobs.requestCancel('job-j3-partial');
+    check('J3-partial. 前置：requestCancel 后仍 partial 且 cancelRequestedAt 非空',
+      jobs.getSyncJob('job-j3-partial').status === 'partial' &&
+      jobs.getSyncJob('job-j3-partial').cancelRequestedAt !== null);
+    const j3pJob = JSON.stringify(jobs.getSyncJob('job-j3-partial'));
+    const j3pF1 = snap15('job-j3-partial', 'f1');
+    const j3pA1 = snap15('job-j3-partial', 'a1');
+    throwsMatch('J3-partial. cancel-requested partial → 门③ 抛 pending cancel',
+      () => jobs.prepareFailedRetry('job-j3-partial'), /pending cancel request, not retryable/);
+    check('J3-partial. 逐字段零变化（未迁 running、未 reset）',
+      JSON.stringify(jobs.getSyncJob('job-j3-partial')) === j3pJob &&
+      snap15('job-j3-partial', 'f1') === j3pF1 && snap15('job-j3-partial', 'a1') === j3pA1);
+
+    // (2) failed+cancel 防御态：failed→cancelled 经 requestCancel 不可达，用显式 raw SQLite 行构造（仅测防御门）
+    seedRetryableJob('job-j3-failed', { statusTarget: 'failed' });
+    const dbJ3 = registry.getMpSyncDatabase();
+    throwsMatch('J3-failed. 前置证 requestCancel 对 failed 不可达（failed→cancelled 非法迁移）',
+      () => jobs.requestCancel('job-j3-failed'), /cannot cancel job in status: failed/);
+    dbJ3.prepare('UPDATE mp_sync_jobs SET cancel_requested_at = ? WHERE id = ?')
+      .run(new Date().toISOString(), 'job-j3-failed');
+    check('J3-failed. 前置：raw 行打 cancel_requested_at 后仍 failed 且 cancelRequestedAt 非空',
+      jobs.getSyncJob('job-j3-failed').status === 'failed' &&
+      jobs.getSyncJob('job-j3-failed').cancelRequestedAt !== null);
+    const j3fJob = JSON.stringify(jobs.getSyncJob('job-j3-failed'));
+    const j3fF1 = snap15('job-j3-failed', 'f1');
+    throwsMatch('J3-failed. failed+cancel 防御态 → 门③ 抛 pending cancel',
+      () => jobs.prepareFailedRetry('job-j3-failed'), /pending cancel request, not retryable/);
+    check('J3-failed. 逐字段零变化',
+      JSON.stringify(jobs.getSyncJob('job-j3-failed')) === j3fJob && snap15('job-j3-failed', 'f1') === j3fF1);
+  }
+
+  // ── J4 happy 原子迁移 + reset ──
+  {
+    seedRetryableJob('job-j4'); // partial: s1 succeeded + f1 failed + a1 auth_required + p1 pending
+    const s1Before = snap15('job-j4', 's1');
+    const p1Before = snap15('job-j4', 'p1');
+    const prep = jobs.prepareFailedRetry('job-j4');
+    check('J4. reset 账号数=2（f1 + a1）', prep.reset === 2);
+    check('J4. job partial -> running', prep.job.status === 'running');
+    check('J4. job.finished_at 清空', prep.job.finishedAt === null);
+    const f1 = jobs.getJobAccount('job-j4', 'f1');
+    const a1 = jobs.getJobAccount('job-j4', 'a1');
+    check('J4. f1 failed -> pending、error_* 清空、retry_count 保留=1',
+      f1.status === 'pending' && f1.errorCode === null && f1.errorMessage === null && f1.retryCount === 1);
+    check('J4. a1 auth_required -> pending、error_* 清空、retry_count 保留=1',
+      a1.status === 'pending' && a1.errorCode === null && a1.retryCount === 1);
+    check('J4. succeeded 账号 s1 深等值不变（不被 reset 触及）', snap15('job-j4', 's1') === s1Before);
+    check('J4. pending 账号 p1 深等值不变（不被 reset 触及）', snap15('job-j4', 'p1') === p1Before);
+    const jobAfter = jobs.getSyncJob('job-j4');
+    check('J4. 聚合：succeeded=1、failed=0（f1/a1 归 pending）、processed=1',
+      jobAfter.succeededAccounts === 1 && jobAfter.failedAccounts === 0 && jobAfter.processedAccounts === 1);
+    // failed 源同样可认领
+    seedRetryableJob('job-j4b', { statusTarget: 'failed' });
+    const prepB = jobs.prepareFailedRetry('job-j4b');
+    check('J4b. failed job → running、reset=2', prepB.job.status === 'running' && prepB.reset === 2);
+  }
+
+  // ── J5 认领互斥（顺序模拟并发）──
+  {
+    seedRetryableJob('job-j5');
+    const first = jobs.prepareFailedRetry('job-j5');
+    check('J5. 第一次认领成功 partial -> running', first.job.status === 'running');
+    const afterJob = JSON.stringify(jobs.getSyncJob('job-j5'));
+    const afterF1 = snap15('job-j5', 'f1');
+    const afterA1 = snap15('job-j5', 'a1');
+    throwsMatch('J5. 第二次认领 → 门② 抛（running 非 partial|failed，只一个获胜）',
+      () => jobs.prepareFailedRetry('job-j5'), /not retryable in status 'running'/);
+    check('J5. 第二次调用零二次变化（job + 账号深等值不变）',
+      JSON.stringify(jobs.getSyncJob('job-j5')) === afterJob &&
+      snap15('job-j5', 'f1') === afterF1 && snap15('job-j5', 'a1') === afterA1);
+  }
+
+  // ── J6 原子回滚（半状态不可达）：注入 reset 账号 UPDATE 失败 → 全回滚，job 仍 partial（迁移一并撤销）（fix-must-fail (f)）──
+  //   故障注入=临时包裹共享连接 db.prepare，在 reset 账号 UPDATE（唯一标记 "SET status = 'pending', error_code = NULL"）
+  //   处抛错；此刻同一 BEGIN IMMEDIATE 内 job partial->running 迁移 UPDATE 已执行，验 catch→ROLLBACK 完整撤销。
+  {
+    seedRetryableJob('job-j6');
+    const jobBefore = JSON.stringify(jobs.getSyncJob('job-j6'));
+    const f1Before = snap15('job-j6', 'f1');
+    const a1Before = snap15('job-j6', 'a1');
+    const s1Before = snap15('job-j6', 's1');
+    const db = registry.getMpSyncDatabase();
+    const origPrepare = db.prepare.bind(db);
+    let threw = false;
+    try {
+      db.prepare = (sql) => {
+        if (typeof sql === 'string' && sql.includes("SET status = 'pending', error_code = NULL")) {
+          throw new Error('injected reset UPDATE failure (J6 fault injection)');
+        }
+        return origPrepare(sql);
+      };
+      try { jobs.prepareFailedRetry('job-j6'); } catch { threw = true; }
+    } finally {
+      db.prepare = origPrepare; // 无论如何还原，避免污染后续用例
+    }
+    check('J6. 注入 reset UPDATE 失败 → prepareFailedRetry 抛错', threw);
+    check('J6. 全回滚：job 仍 partial（partial->running 迁移一并撤销，无 running 半状态）',
+      jobs.getSyncJob('job-j6').status === 'partial' && JSON.stringify(jobs.getSyncJob('job-j6')) === jobBefore);
+    check('J6. 全回滚：failed/auth_required 账号未落 pending、深等值不变',
+      jobs.getJobAccount('job-j6', 'f1').status === 'failed' &&
+      jobs.getJobAccount('job-j6', 'a1').status === 'auth_required' &&
+      snap15('job-j6', 'f1') === f1Before && snap15('job-j6', 'a1') === a1Before);
+    check('J6. succeeded 账号不变', snap15('job-j6', 's1') === s1Before);
+    // 还原后 prepareFailedRetry 正常工作（证 db.prepare 已复原、无残留副作用）
+    const okAfter = jobs.prepareFailedRetry('job-j6');
+    check('J6. 还原后 prepareFailedRetry 正常（partial->running、reset=2）',
+      okAfter.job.status === 'running' && okAfter.reset === 2);
   }
 
   console.log(`\nPASS smoke_mp_sync_jobs: ${passed} assertions`);

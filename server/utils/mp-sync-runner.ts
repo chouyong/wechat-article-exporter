@@ -20,6 +20,7 @@ import {
   isCancelRequested,
   reconcileOrphanedJobs,
   resetInterruptedAccounts,
+  prepareFailedRetry,
   listRunningJobIdsForRecovery,
   type MpSyncJob,
   type MpSyncJobAccount,
@@ -418,7 +419,26 @@ export async function runSyncJobPool(
   deps: RunSyncJobDeps,
   options: ConcurrencyControllerOptions = {}
 ): Promise<RunSyncJobPoolResult> {
+  // C3-6 保行为重构（extract-and-delegate）：公开入口的唯一校验点 = resolveRetryContext（与现状同位、同行为，
+  // 首次 DB 写前 fail-fast、零持久副作用），随后委托私有 runSyncJobPoolResolved 承载整段池体。对既有调用方
+  // （recoverOneJob / C3-5 恢复 / 测试）返回值、异常、行为逐字节等价，锁既有回归。
   const ctx = resolveRetryContext(deps); // C3-3：校验/规范化前置于 startJob（首次 DB 写），零持久副作用
+  return runSyncJobPoolResolved(jobId, deps, ctx, options);
+}
+
+/**
+ * C3-6 私有池核心：承载原 runSyncJobPool 于 startJob 之后的整段池体（controller / pump / settle / cancel 收口 /
+ * finalize 逐字节迁入、语义不变），**接受入口已验证的 ctx、核心内绝不再 resolveRetryContext(deps)**。由公开
+ * runSyncJobPool（wrapper）与 C3-6 retryFailedJob 共用：后者在入口只解析一次 ctx 并交入此处，故 prepare 提交后
+ * 对原始可变 deps 的漂移（cancel 探针改写 retry/timeoutMs）对退避/超时一律 inert（冻结「入口已验证快照继续运行」
+ * 语义）。deps 在此仅供 fetchPage / resolveOptions / isCancelRequested；clock / retry / timeoutMs 一律取自 ctx。
+ */
+async function runSyncJobPoolResolved(
+  jobId: string,
+  deps: RunSyncJobDeps,
+  ctx: ResolvedRetryContext,
+  options: ConcurrencyControllerOptions = {}
+): Promise<RunSyncJobPoolResult> {
   const job = startJob(jobId); // queued -> running（幂等）
   const pending = listJobAccounts(jobId, 'pending'); // 已按 priority DESC, fakeid 排序
   // C3-4/§①：缓冲改稀疏可空类型——cancel 路径未 admit 的槽位保持 undefined，resolve 后 filter 压实（§④/P1）。
@@ -889,4 +909,47 @@ async function recoverOneJob(jobId: string, deps: RunSyncJobDeps): Promise<'reco
   const result = await runSyncJobPool(jobId, deps); // 续跑全部 pending（含刚 reset 的 + 原 pending）
   // F-C3-5-P2：读 pool 返回值分类——「reset 后途中 cancel」pool 正常 resolve 且 job.status='cancelled'。
   return result.job.status === 'cancelled' ? 'cancelled' : 'recovered';
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// C3-6 failed_only 重试编排（A 类·纯离线：复用既有 runSyncJobPool 核心，不新写账号抓取循环）
+//
+// 方案：docs/PLAN_WECHAT_EXPORTER_C3_6_FAILED_ONLY_RETRY.md（首审→R3 四审 Codex GO）。切片边界：按 jobId 显式
+// 重试 partial|failed job——只 reset failed/auth_required 账号、复用唯一 pool 只重跑 pending、succeeded 零 fetch、
+// cancel 严格优先、无 DDL / 无新持久态 / 无生产接线。所有权租约 / HTTP retry API / 真实网络 = OUT（各需重新授权）。
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * C3-6 failed_only 重试入口：按 jobId 显式重试 partial|failed job，复用 runSyncJobPoolResolved 只重跑 pending。
+ *
+ * 编排（顺序即不变量）：
+ *   ① **resolveRetryContext(deps) 最先且仅此一次**——校验/规范化 retry+timeout，非法即 fail-fast 抛 RangeError、
+ *      **零持久写入**（同 runSyncJob / runSyncJobPool wrapper 的“配置错误前置于首次 DB 写”不变量）；产出已验证 ctx。
+ *   ② **事务外快速 cancel 探针（非权威）**——deps.isCancelRequested ?? 默认 registry probe；命中即快速失败，
+ *      仅省一次事务，**不承担权威门职责**（权威 cancel 门在 prepareFailedRetry 门③）。
+ *   ③ **prepareFailedRetry(jobId) 原子认领**——4 门（存在 / 源态 partial|failed / cancel-null / assertJobTransition）
+ *      + 迁 running + reset failed/auth_required→pending 全在单 BEGIN IMMEDIATE；running/completed/queued/cancelled
+ *      由门②、cancel-requested 由门③ 在**任何写入前**权威拒绝 fail-closed。
+ *   ④ **交入口已验证 ctx 给 runSyncJobPoolResolved(jobId, deps, ctx)** 只重跑 pending——池核心**绝不再**
+ *      resolveRetryContext(deps)，故 prepare 提交后 cancel 探针即便改写 deps.retry/timeoutMs 也只改原始 deps、
+ *      不改 ctx（normalizeRetryOptions 返回全新对象 → ctx.retry ≠ deps.retry），退避/超时一律用入口快照 → inert。
+ *
+ * 由此锁死「**任何 DB 写前拒绝 XOR 用入口已验证快照跑完**」：deps 入口即非法 → ①抛、prepare 前零写；deps 合法但
+ * 提交后漂移 → 用 ctx 跑完、绝不出现「prepare 提交后才抛配置错误」的晚写半状态。
+ *
+ * **succeeded 不二抓**主因 = prepareFailedRetry reset 源门不含 succeeded（succeeded 账号仍 succeeded）+ pool 只
+ * 枚举 pending；applyAccountOutcome 终态硬门是第二层回写防御，不新写去重。
+ *
+ * **mid-retry cancel**：重跑期间 cancel 到达 → pool 内 C3-4 probe 停 admission→排空→cancelPendingAccounts→
+ * finalizeJob 返回 job.status='cancelled' 且**正常 resolve**；调用方读 result.job.status 分类（同 recoverOneJob）。
+ *
+ * 返回 finalize 后的 job + 逐账号摘要（RunSyncJobResult；pool 的 concurrency 观测为超集，此处按 RunSyncJobResult 收窄）。
+ */
+export async function retryFailedJob(jobId: string, deps: RunSyncJobDeps): Promise<RunSyncJobResult> {
+  const ctx = resolveRetryContext(deps); // ★① 单次解析：校验/规范化最先，非法配置零持久写入（同 runSyncJob / pool wrapper）
+  // ★② 事务外快速 cancel 探针（非权威；权威 cancel 门在 prepareFailedRetry 门③）
+  const probe = deps.isCancelRequested ?? isCancelRequested;
+  if (probe(jobId)) throw new Error(`job has pending cancel request, not retryable: ${jobId}`);
+  prepareFailedRetry(jobId); // ★③ 原子认领：4 门 + 迁 running + reset failed/auth_required→pending（权威门全在事务内）
+  return runSyncJobPoolResolved(jobId, deps, ctx); // ★④ 交入口已验证 ctx；池核心不再校验 deps → 提交后 deps 漂移 inert
 }
