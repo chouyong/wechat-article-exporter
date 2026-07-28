@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { extractWechatPagePublishedTime, resolveWechatPublishedTime } from '../server/utils/wechat-published-time.ts';
+import {
+  buildWechatPublishedFrontmatterLine,
+  extractWechatPagePublishedTime,
+  formatWechatPublishedTime,
+  resolveWechatPublishedTime,
+} from '../server/utils/wechat-published-time.ts';
 
 const fallbackAt = new Date('2026-07-24T14:00:46.000Z');
 const pageCases = [
@@ -20,12 +25,22 @@ for (const [, pageMinute, expectedIso] of pageCases) {
   assert.equal(resolved.source, 'page');
   assert.equal(resolved.publishedRaw, `${pageMinute}:00`);
   assert.equal(resolved.publishedAt?.toISOString(), expectedIso);
+  assert.equal(
+    formatWechatPublishedTime(resolved.publishedAt, resolved.publishedRaw),
+    `${pageMinute.replace(' ', 'T')}:00+08:00`
+  );
+  assert.equal(
+    buildWechatPublishedFrontmatterLine(resolved.publishedAt, resolved.publishedRaw),
+    `published: "${pageMinute.replace(' ', 'T')}:00+08:00"`
+  );
 }
 
 const objectField = extractWechatPagePublishedTime(
   '<script>window.meta = { "create_time": "2026-07-25 07:53" };</script>'
 );
 assert.equal(objectField?.publishedRaw, '2026-07-25 07:53:00');
+assert.equal(formatWechatPublishedTime(null, objectField?.publishedRaw), '2026-07-25 07:53:00');
+assert.equal(formatWechatPublishedTime(fallbackAt, 'ignored'), '2026-07-24T22:00:46+08:00');
 
 for (const htmlText of [
   '<script>var createTime = "2026-02-30 08:00";</script>',

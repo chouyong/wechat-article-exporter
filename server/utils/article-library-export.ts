@@ -9,7 +9,11 @@ import { parseCgiDataNew } from '#shared/utils/html';
 import { createMarkdownTurndownService, postProcessMarkdown } from '#shared/utils/markdown';
 import { renderHTMLFromCgiDataNew, renderTextFromCgiDataNew } from '#shared/utils/renderer';
 import { USER_AGENT } from '~/config';
-import { resolveWechatPublishedTime } from './wechat-published-time';
+import {
+  buildWechatPublishedFrontmatterLine,
+  formatWechatPublishedTime,
+  resolveWechatPublishedTime,
+} from './wechat-published-time';
 
 export type ArticleLibraryExportMode = 'full' | 'recent-3d' | 'failed-only' | 'cached-only' | 'single';
 export type ArticleLibraryExportJobStatus = 'queued' | 'running' | 'completed' | 'failed';
@@ -264,13 +268,6 @@ function formatDateOnlyInTimezone(date: Date | null, timeZone = EXPORT_TIMEZONE)
   return `${parts.year}-${parts.month}-${parts.day}`;
 }
 
-function formatPublished(date: Date | null, raw: string) {
-  if (raw) return raw;
-  if (!date) return '';
-  const parts = formatDatePartsInTimezone(date);
-  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
-}
-
 function formatDayFolder(date: Date | null) {
   const target = date || new Date();
   const parts = formatDatePartsInTimezone(target);
@@ -304,14 +301,13 @@ function toCheerioText(value: string) {
 }
 
 function buildFrontmatter(meta: ArticleMeta, createdAt: Date) {
-  const published = formatPublished(meta.publishedAt, meta.publishedRaw);
   return [
     '---',
     `title: "${yamlEscape(meta.title)}"`,
     `source: "${yamlEscape(meta.sourceUrl)}"`,
     'author:',
     meta.accountName ? `  - "[[${yamlEscape(meta.accountName)}]]"` : '  - "[[未知公众号]]"',
-    `published: "${yamlEscape(published)}"`,
+    buildWechatPublishedFrontmatterLine(meta.publishedAt, meta.publishedRaw),
     `created: ${formatDateOnlyInTimezone(createdAt)}`,
     `description: "${yamlEscape(meta.description)}"`,
     'tags:',
@@ -1296,7 +1292,7 @@ async function runJob(jobId: string) {
               originalHtml,
               candidate.accountName,
               candidate.title,
-              formatPublished(publishedAt, ''),
+              formatWechatPublishedTime(publishedAt),
               publishedAt,
             );
             const markdownBody = await extractMarkdownBody(originalHtml);
