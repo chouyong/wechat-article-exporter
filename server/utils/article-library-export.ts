@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { access, appendFile, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { access, appendFile, mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import JSZip from 'jszip';
 import PQueue from 'p-queue';
@@ -167,6 +167,7 @@ const proxyDispatcher = (() => {
 
 const jobs = new Map<string, ArticleLibraryExportJob>();
 const previewJobs = new Map<string, ArticleLibraryExportPreviewJob>();
+const jobPersistenceChains = new Map<string, Promise<void>>();
 let latestJobId: string | null = null;
 let latestPreviewJobId: string | null = null;
 let scannedLibraryIndexCache:
@@ -1147,18 +1148,35 @@ async function extractMarkdownBody(htmlText: string) {
   throw new Error('原文中未找到可导出的正文内容');
 }
 
-function updateJob(jobId: string, patch: Partial<ArticleLibraryExportJob>) {
+async function persistJobJson(key: string, targetPath: string, value: unknown) {
+  const serialized = JSON.stringify(value, null, 2);
+  const previous = jobPersistenceChains.get(key) || Promise.resolve();
+  const current = previous.catch(() => undefined).then(async () => {
+    await ensureDir(path.dirname(targetPath));
+    const temporaryPath = `${targetPath}.tmp`;
+    await writeFile(temporaryPath, serialized, 'utf8');
+    await rename(temporaryPath, targetPath);
+  });
+  jobPersistenceChains.set(key, current);
+  try {
+    await current;
+  } finally {
+    if (jobPersistenceChains.get(key) === current) {
+      jobPersistenceChains.delete(key);
+    }
+  }
+}
+
+async function updateJob(jobId: string, patch: Partial<ArticleLibraryExportJob>) {
   const current = jobs.get(jobId);
   if (!current) return;
   const next = { ...current, ...patch };
   jobs.set(jobId, next);
-  void persistJob(next);
+  await persistJob(next);
 }
 
 async function persistJob(job: ArticleLibraryExportJob) {
-  const jobDir = getJobDir(job.id);
-  await ensureDir(jobDir);
-  await writeFile(path.join(jobDir, 'job.json'), JSON.stringify(job, null, 2), 'utf8');
+  await persistJobJson(`export:${job.id}`, path.join(getJobDir(job.id), 'job.json'), job);
 }
 
 async function createJobZip(job: ArticleLibraryExportJob, jobFiles: Array<{ relativePath: string; absolutePath: string }>) {
@@ -1177,13 +1195,20 @@ function toZipEntryRelativePath(exportRelativePath: string) {
   return normalizePath(exportRelativePath).replace(/^library\//, '');
 }
 
-async function appendFailure(job: ArticleLibraryExportJob, url: string, reason: string) {
-  const failures = job.failureSamples.slice();
+async function appendFailure(jobId: string, title: string, url: string, reason: string) {
+  await appendFile(getJobFailureLogPath(jobId), `${JSON.stringify({ url, reason })}\n`, 'utf8');
+  const latest = jobs.get(jobId);
+  if (!latest) return;
+  const failures = latest.failureSamples.slice();
   if (failures.length < FAILURE_SAMPLE_LIMIT) {
     failures.push({ url, reason });
   }
-  await appendFile(getJobFailureLogPath(job.id), `${JSON.stringify({ url, reason })}\n`, 'utf8');
-  updateJob(job.id, { failureSamples: failures });
+  await updateJob(jobId, {
+    failureSamples: failures,
+    processedCandidates: latest.processedCandidates + 1,
+    failedCount: latest.failedCount + 1,
+    message: `导出失败：${title}`,
+  });
 }
 
 async function runJob(jobId: string) {
@@ -1191,7 +1216,7 @@ async function runJob(jobId: string) {
   if (!job) return;
 
   try {
-    updateJob(jobId, { status: 'running', startedAt: new Date().toISOString(), message: '正在读取系统内文章快照' });
+    await updateJob(jobId, { status: 'running', startedAt: new Date().toISOString(), message: '正在读取系统内文章快照' });
 
     const snapshot = await readSnapshot();
     if (!snapshot) {
@@ -1200,7 +1225,7 @@ async function runJob(jobId: string) {
 
     const candidates = await resolveCandidates(snapshot, job);
     const index = await readIndex();
-    updateJob(jobId, {
+    await updateJob(jobId, {
       snapshotCreatedAt: snapshot.createdAt,
       totalAccounts: snapshot.accounts.length,
       scannedArticles: snapshot.articles.length,
@@ -1213,7 +1238,7 @@ async function runJob(jobId: string) {
     });
 
     if (candidates.length === 0) {
-      updateJob(jobId, {
+      await updateJob(jobId, {
         status: 'completed',
         finishedAt: new Date().toISOString(),
         message: job.mode === 'single'
@@ -1258,7 +1283,7 @@ async function runJob(jobId: string) {
               }
               const latest = jobs.get(jobId);
               if (!latest) return;
-              updateJob(jobId, {
+              await updateJob(jobId, {
                 processedCandidates: latest.processedCandidates + 1,
                 skippedExistingCount: latest.skippedExistingCount + 1,
                 message: `已跳过：${candidate.title}`,
@@ -1316,20 +1341,13 @@ async function runJob(jobId: string) {
 
             const latest = jobs.get(jobId);
             if (!latest) return;
-            updateJob(jobId, {
+            await updateJob(jobId, {
               processedCandidates: latest.processedCandidates + 1,
               exportedCount: latest.exportedCount + 1,
               message: `已导出：${meta.title}`,
             });
           } catch (error) {
-            const latest = jobs.get(jobId);
-            if (!latest) return;
-            await appendFailure(latest, canonicalUrl, (error as Error).message);
-            updateJob(jobId, {
-              processedCandidates: latest.processedCandidates + 1,
-              failedCount: latest.failedCount + 1,
-              message: `导出失败：${candidate.title}`,
-            });
+            await appendFailure(jobId, candidate.title, canonicalUrl, (error as Error).message);
           }
         })
       )
@@ -1344,14 +1362,14 @@ async function runJob(jobId: string) {
       : latest.skippedExistingCount > 0 && latest.failedCount === 0
         ? `任务完成：本次无新增正文需要导出，已跳过 ${latest.skippedExistingCount} 篇已存在文章`
         : `任务完成：未生成可下载文件，跳过 ${latest.skippedExistingCount} 篇，失败 ${latest.failedCount} 篇`;
-    updateJob(jobId, {
+    await updateJob(jobId, {
       status: 'completed',
       finishedAt: new Date().toISOString(),
       zipPath,
       message: completionMessage,
     });
   } catch (error) {
-    updateJob(jobId, {
+    await updateJob(jobId, {
       status: 'failed',
       finishedAt: new Date().toISOString(),
       message: `任务失败：${(error as Error).message}`,
@@ -1402,7 +1420,9 @@ export async function startArticleLibraryExportJob(
   await writeFile(getJobFailureLogPath(id), '', 'utf8');
   await persistJob(job);
   setTimeout(() => {
-    void runJob(id);
+    void runJob(id).catch(error => {
+      console.error('文章库导出后台任务异常', error);
+    });
   }, 0);
   return job;
 }
@@ -1452,7 +1472,9 @@ export async function startSingleArticleLibraryExportJob(urls: string[]) {
   await writeFile(getJobFailureLogPath(id), '', 'utf8');
   await persistJob(job);
   setTimeout(() => {
-    void runJob(id);
+    void runJob(id).catch(error => {
+      console.error('单篇文章库导出后台任务异常', error);
+    });
   }, 0);
   return job;
 }
@@ -1494,7 +1516,7 @@ export async function hydrateArticleLibraryExportJobsFromDisk() {
         job.status = 'failed';
         job.finishedAt = new Date().toISOString();
         job.message = '任务因服务重启中断，请重新发起';
-        await writeFile(jobPath, JSON.stringify(job, null, 2), 'utf8');
+        await persistJob(job);
       }
       jobs.set(job.id, job);
       loaded.push(job);
@@ -1548,17 +1570,15 @@ async function writePreviewCache(
 }
 
 async function persistPreviewJob(job: ArticleLibraryExportPreviewJob) {
-  const jobDir = path.join(PREVIEW_JOBS_ROOT, job.id);
-  await ensureDir(jobDir);
-  await writeFile(path.join(jobDir, 'job.json'), JSON.stringify(job, null, 2), 'utf8');
+  await persistJobJson(`preview:${job.id}`, path.join(PREVIEW_JOBS_ROOT, job.id, 'job.json'), job);
 }
 
-function updatePreviewJob(jobId: string, patch: Partial<ArticleLibraryExportPreviewJob>) {
+async function updatePreviewJob(jobId: string, patch: Partial<ArticleLibraryExportPreviewJob>) {
   const current = previewJobs.get(jobId);
   if (!current) return;
   const next = { ...current, ...patch };
   previewJobs.set(jobId, next);
-  void persistPreviewJob(next);
+  await persistPreviewJob(next);
 }
 
 async function runPreviewJob(jobId: string) {
@@ -1566,7 +1586,7 @@ async function runPreviewJob(jobId: string) {
   if (!job) return;
 
   try {
-    updatePreviewJob(jobId, {
+    await updatePreviewJob(jobId, {
       status: 'running',
       startedAt: new Date().toISOString(),
       message: '正在后台扫描系统内已同步文章',
@@ -1574,7 +1594,7 @@ async function runPreviewJob(jobId: string) {
 
     const cached = await readPreviewCache(job.mode, job.syncFromTimestamp, job.syncToTimestamp);
     if (cached) {
-      updatePreviewJob(jobId, {
+      await updatePreviewJob(jobId, {
         status: 'completed',
         finishedAt: new Date().toISOString(),
         message: '已命中 10 分钟内的预估缓存',
@@ -1585,14 +1605,14 @@ async function runPreviewJob(jobId: string) {
 
     const preview = await previewArticleLibraryExport(job.mode, job.syncFromTimestamp, job.syncToTimestamp);
     await writePreviewCache(preview, job.syncFromTimestamp, job.syncToTimestamp);
-    updatePreviewJob(jobId, {
+    await updatePreviewJob(jobId, {
       status: 'completed',
       finishedAt: new Date().toISOString(),
       message: '预估完成',
       preview,
     });
   } catch (error) {
-    updatePreviewJob(jobId, {
+    await updatePreviewJob(jobId, {
       status: 'failed',
       finishedAt: new Date().toISOString(),
       message: `预估失败：${(error as Error).message}`,
@@ -1656,7 +1676,9 @@ export async function startArticleLibraryExportPreviewJob(
   latestPreviewJobId = job.id;
   await persistPreviewJob(job);
   setTimeout(() => {
-    void runPreviewJob(job.id);
+    void runPreviewJob(job.id).catch(error => {
+      console.error('文章库导出预估后台任务异常', error);
+    });
   }, 0);
   return job;
 }
@@ -1686,7 +1708,7 @@ export async function hydrateArticleLibraryExportPreviewJobsFromDisk() {
         job.status = 'failed';
         job.finishedAt = new Date().toISOString();
         job.message = '预估任务因服务重启中断，请重新发起';
-        await writeFile(jobPath, JSON.stringify(job, null, 2), 'utf8');
+        await persistPreviewJob(job);
       }
       previewJobs.set(job.id, job);
       loaded.push(job);
