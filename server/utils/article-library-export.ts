@@ -1,14 +1,19 @@
 import { createHash } from 'node:crypto';
-import { access, appendFile, mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises';
+import { access, appendFile, mkdir, readdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import * as cheerio from 'cheerio';
 import JSZip from 'jszip';
 import PQueue from 'p-queue';
-import * as cheerio from 'cheerio';
 import { ProxyAgent } from 'undici';
 import { parseCgiDataNew } from '#shared/utils/html';
 import { createMarkdownTurndownService, postProcessMarkdown } from '#shared/utils/markdown';
 import { renderHTMLFromCgiDataNew, renderTextFromCgiDataNew } from '#shared/utils/renderer';
 import { USER_AGENT } from '~/config';
+import {
+  buildExactRecoveryTargetPlan,
+  validateExactRecoveryJobId,
+  validateExactRecoverySourceJob,
+} from './article-library-exact-targets';
 import {
   buildWechatPublishedFrontmatterLine,
   formatWechatPublishedTime,
@@ -66,6 +71,7 @@ interface PersistedHtmlSnapshotIndex {
 
 interface ExportCandidate extends SnapshotArticle {
   accountName: string;
+  recoveryTargetOnly?: boolean;
 }
 
 interface ArticleMeta {
@@ -92,6 +98,7 @@ export interface ArticleLibraryExportJob {
   syncFromTimestamp: number | null;
   syncToTimestamp: number | null;
   targetUrls?: string[];
+  recoverySourceJobId?: string;
   status: ArticleLibraryExportJobStatus;
   createdAt: string;
   startedAt: string | null;
@@ -777,8 +784,46 @@ function buildSpecificCandidates(snapshot: PersistedSnapshot, urls: string[]) {
   return Array.from(deduped.values()).sort((a, b) => a.update_time - b.update_time);
 }
 
+async function readExactRecoverySourceJob(recoverySourceJobId: string, targetUrls: string[]) {
+  const sourceId = validateExactRecoveryJobId(recoverySourceJobId);
+  const sourceJob = await readJsonWithFallback<unknown>(path.join(getJobDir(sourceId), 'job.json'));
+  return validateExactRecoverySourceJob(sourceJob, sourceId, targetUrls);
+}
+
+async function buildExactRecoveryCandidates(
+  snapshot: PersistedSnapshot,
+  recoverySourceJobId: string,
+  targetUrls: string[]
+) {
+  const validatedUrls = await readExactRecoverySourceJob(recoverySourceJobId, targetUrls);
+  const nicknameByFakeid = new Map(snapshot.accounts.map(account => [account.fakeid, (account.nickname || '').trim()]));
+  return buildExactRecoveryTargetPlan(snapshot.articles || [], validatedUrls).map(item => {
+    const article = item.snapshotArticle;
+    if (article) {
+      return {
+        ...article,
+        link: item.url,
+        accountName: nicknameByFakeid.get(article.fakeid) || article.fakeid,
+      };
+    }
+    return {
+      fakeid: '',
+      aid: '',
+      link: item.url,
+      title: '微信公众号文章',
+      create_time: 0,
+      update_time: 0,
+      accountName: '',
+      recoveryTargetOnly: true,
+    };
+  });
+}
+
 async function resolveCandidates(snapshot: PersistedSnapshot, job: ArticleLibraryExportJob) {
   if (job.mode === 'single') {
+    if (job.recoverySourceJobId !== undefined) {
+      return await buildExactRecoveryCandidates(snapshot, job.recoverySourceJobId, job.targetUrls || []);
+    }
     return buildSpecificCandidates(snapshot, job.targetUrls || []);
   }
   if (job.mode === 'failed-only') {
@@ -1267,7 +1312,7 @@ async function runJob(jobId: string) {
           const canonicalUrl = canonicalizeUrl(candidate.link);
           const publishedAt = candidate.create_time ? new Date(candidate.create_time * 1000) : null;
 
-          if (job.mode !== 'single') {
+          if (job.mode !== 'single' || job.recoverySourceJobId !== undefined) {
             const exported = await isCandidateAlreadyExported(candidate, index);
             if (exported.exported) {
               index.items[canonicalUrl] = {
@@ -1275,7 +1320,7 @@ async function runJob(jobId: string) {
                 exportedAt: new Date().toISOString(),
                 title: exported.title || candidate.title,
               };
-              if (exported.relativePath) {
+              if (exported.relativePath && job.recoverySourceJobId === undefined) {
                 jobFiles.push({
                   relativePath: toZipEntryRelativePath(exported.relativePath),
                   absolutePath: path.join(EXPORT_ROOT, exported.relativePath),
@@ -1301,7 +1346,7 @@ async function runJob(jobId: string) {
             if (!originalHtml) {
               throw new Error('cached html not found');
             }
-            if (originalHtml) {
+            if (originalHtml && !candidate.recoveryTargetOnly) {
               await updateArticleLibraryHtmlSnapshot([
                 {
                   fakeid: candidate.fakeid,
@@ -1357,11 +1402,12 @@ async function runJob(jobId: string) {
     const latest = jobs.get(jobId);
     if (!latest) return;
     const zipPath = jobFiles.length > 0 ? await createJobZip(latest, jobFiles) : null;
-    const completionMessage = jobFiles.length > 0
-      ? `任务完成：导出 ${jobFiles.length} 篇，跳过 ${latest.skippedExistingCount} 篇，失败 ${latest.failedCount} 篇`
-      : latest.skippedExistingCount > 0 && latest.failedCount === 0
-        ? `任务完成：本次无新增正文需要导出，已跳过 ${latest.skippedExistingCount} 篇已存在文章`
-        : `任务完成：未生成可下载文件，跳过 ${latest.skippedExistingCount} 篇，失败 ${latest.failedCount} 篇`;
+    const completionMessage =
+      latest.exportedCount > 0
+        ? `任务完成：导出 ${latest.exportedCount} 篇，跳过 ${latest.skippedExistingCount} 篇，失败 ${latest.failedCount} 篇`
+        : latest.skippedExistingCount > 0 && latest.failedCount === 0
+          ? `任务完成：本次无新增正文需要导出，已跳过 ${latest.skippedExistingCount} 篇已存在文章`
+          : `任务完成：未生成可下载文件，跳过 ${latest.skippedExistingCount} 篇，失败 ${latest.failedCount} 篇`;
     await updateJob(jobId, {
       status: 'completed',
       finishedAt: new Date().toISOString(),
@@ -1427,13 +1473,16 @@ export async function startArticleLibraryExportJob(
   return job;
 }
 
-export async function startSingleArticleLibraryExportJob(urls: string[]) {
+export async function startSingleArticleLibraryExportJob(urls: string[], recoverySourceJobId?: string) {
   await ensureDir(JOBS_ROOT);
   await ensureDir(LIBRARY_ROOT);
 
   const normalizedUrls = Array.from(new Set(urls.map(canonicalizeUrl).filter(Boolean)));
   if (normalizedUrls.length === 0) {
     throw new Error('缺少有效文章链接');
+  }
+  if (recoverySourceJobId !== undefined) {
+    await readExactRecoverySourceJob(recoverySourceJobId, normalizedUrls);
   }
 
   const activeJob = Array.from(jobs.values()).find(job => job.status === 'queued' || job.status === 'running');
@@ -1448,6 +1497,7 @@ export async function startSingleArticleLibraryExportJob(urls: string[]) {
     syncFromTimestamp: null,
     syncToTimestamp: null,
     targetUrls: normalizedUrls,
+    ...(recoverySourceJobId !== undefined ? { recoverySourceJobId } : {}),
     status: 'queued',
     createdAt: new Date().toISOString(),
     startedAt: null,
