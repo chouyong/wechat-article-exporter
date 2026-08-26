@@ -29,3 +29,9 @@ samples/**/output
 
 # wrangler
 .wrangler
+
+# Local structural indexes
+graphify-out/
+.claude/
+.codegraph/
+.meta-kim/
