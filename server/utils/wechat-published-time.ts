@@ -4,6 +4,8 @@ export interface WechatPublishedTime {
   source: 'page' | 'fallback';
 }
 
+const SHANGHAI_UTC_OFFSET_MS = 8 * 60 * 60 * 1000;
+
 const PAGE_PUBLISHED_PATTERNS = [
   /\b(?:var|let|const)\s+createTime\s*=\s*(['"])(\d{4}-\d{2}-\d{2} \d{2}:\d{2})\1/,
   /(?:\bcreate_time\b|['"]create_time['"])\s*:\s*(['"])(\d{4}-\d{2}-\d{2} \d{2}:\d{2})\1/,
@@ -42,6 +44,21 @@ export function extractWechatPagePublishedTime(htmlText: string): WechatPublishe
     if (parsed) return parsed;
   }
   return null;
+}
+
+export function formatWechatPublishedTime(publishedAt: Date | null, fallbackRaw = '') {
+  if (!publishedAt || Number.isNaN(publishedAt.getTime())) return fallbackRaw;
+  return new Date(publishedAt.getTime() + SHANGHAI_UTC_OFFSET_MS).toISOString().replace(/\.\d{3}Z$/, '+08:00');
+}
+
+export function buildWechatPublishedFrontmatterLine(publishedAt: Date | null, fallbackRaw = '') {
+  const published = formatWechatPublishedTime(publishedAt, fallbackRaw)
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\r/g, ' ')
+    .replace(/\n/g, ' ')
+    .trim();
+  return `published: "${published}"`;
 }
 
 export function resolveWechatPublishedTime(
