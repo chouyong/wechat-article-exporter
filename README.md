@@ -65,6 +65,29 @@
 
 在公众号后台写文章时支持搜索其他公众号的文章功能，以此来实现抓取指定公众号所有文章的目的。
 
+## :clipboard: 运维交接（2026-05-28）
+
+以下记录用于本地持续导出任务的交接与复核，详细版本见 `AGENTS.md`。
+
+- 时间窗口：`2026-04-01 00:00:00` 至 `2026-04-30 23:59:59`（`Asia/Shanghai`）。
+- 数据源硬规则：账号与文章导出仅使用 `wechat-article-exporter` 系统内已同步数据与缓存；不使用 `wechat-rss`、`we-mp-rss`、RSS 缓存。
+- 执行策略：采用 `cache-first`（优先本地 html/snapshot 缓存）+ 离线导出；仅对缺失项低速补抓，并用 `source-index.json` 去重与映射。
+- 稳定性参数（`server/utils/article-library-export.ts`）：
+  - `ARTICLE_CONCURRENCY = 1`
+  - `REQUEST_DELAY_MS = 3500`
+  - `ARTICLE_REQUEST_TIMEOUT_MS = 45000`
+  - `ARTICLE_REQUEST_RETRY = 2`
+- `2026-05-28` 核验结果：
+  - 仅统计未删除文章（`is_deleted != true`）：`total=6263, covered=6263, missing=0`
+  - 统计窗口内全部文章（含已删除）：`total=6732, covered=6263, missing=469`
+- 主要产物路径：
+  - `data/exports/article-library/jobs/offline-cached-april-2026-v2/export.zip`
+  - `data/exports/article-library/jobs/offline-cached-april-2026-missing92/export.zip`
+
+> 结论：按“有效文章（未删除）”口径，四月区间导出已闭环（`6263/6263`）。
+
+如需查看 2026-01~03 的导出排查与修复复盘，请见 [导出复盘](./docs/export-postmortem-2026-01-to-03.md)。
+
 
 ## :memo: 许可
 

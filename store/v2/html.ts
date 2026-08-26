@@ -26,3 +26,7 @@ export async function updateHtmlCache(html: HtmlAsset): Promise<boolean> {
 export async function getHtmlCache(url: string): Promise<HtmlAsset | undefined> {
   return db.html.get(url);
 }
+
+export async function getAllHtmlCache(): Promise<HtmlAsset[]> {
+  return db.html.toArray();
+}

@@ -220,7 +220,7 @@ async function parseCgiDataNewOnServer(html: string): Promise<any> {
       method: 'POST',
       body: code,
     }).then(res => res.json());
-    if (data && data.executionError === null) {
+    if (data && data.executionError === null && data.window?.cgiDataNew) {
       return data.window.cgiDataNew;
     }
     return null;

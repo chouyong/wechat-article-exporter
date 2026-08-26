@@ -1,0 +1,24 @@
+services:
+  wechat-article-exporter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: 2.3.17
+        BUILD_IMAGE: ccr.ccs.tencentyun.com/buildingai/node:22.20.0
+        RUNTIME_IMAGE: ccr.ccs.tencentyun.com/buildingai/node:22.20.0
+    container_name: wechat-article-exporter
+    ports:
+      - '3001:3000'
+    env_file:
+      - .env
+    environment:
+      NODE_USE_ENV_PROXY: '1'
+      HTTP_PROXY: 'http://host.docker.internal:18080'
+      HTTPS_PROXY: 'http://host.docker.internal:18080'
+      ALL_PROXY: 'http://host.docker.internal:18080'
+      NO_PROXY: '127.0.0.1,localhost,host.docker.internal'
+    volumes:
+      - ./data/kv:/app/.data/kv
+      - ./data/exports:/app/data/exports
+    restart: unless-stopped

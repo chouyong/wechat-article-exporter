@@ -3,6 +3,7 @@
     v-model="selected"
     size="md"
     color="gray"
+    multiple
     searchable
     searchable-placeholder="筛选公众号..."
     clear-search-on-close
@@ -11,9 +12,13 @@
     placeholder="请选择公众号"
   >
     <template #label>
-      <UAvatar v-if="selected" :src="selected.round_head_img" size="2xs" />
-      <span v-if="selected" class="max-w-30 line-clamp-1">{{ selected.nickname }}</span>
-      <span v-if="selected" class="shrink-0">({{ selected.articles }}篇)</span>
+      <template v-if="selected.length === 1">
+        <UAvatar :src="selected[0].round_head_img" size="2xs" />
+        <span class="max-w-30 line-clamp-1">{{ selected[0].nickname }}</span>
+        <span class="shrink-0">({{ selected[0].articles }}篇)</span>
+      </template>
+      <span v-else-if="selected.length > 1">已选择 {{ selected.length }} 个公众号</span>
+      <span v-else>请选择公众号</span>
     </template>
     <template #option="{ option: account }">
       <UAvatar :src="account.round_head_img" size="sm" />
@@ -48,5 +53,5 @@ const sortedAccountInfos = computed(() => {
   return cachedAccountInfos;
 });
 
-const selected = defineModel<MpAccount | undefined>();
+const selected = defineModel<MpAccount[]>({ default: [] });
 </script>

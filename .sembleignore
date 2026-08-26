@@ -1,0 +1,5 @@
+data/
+public/imports/
+.codegraph/
+tmp/*
+!tmp/http_to_socks_proxy.mjs

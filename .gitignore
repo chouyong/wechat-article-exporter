@@ -29,3 +29,12 @@ samples/**/output
 
 # wrangler
 .wrangler
+
+# Local runtime data and generated inspection artifacts
+data/
+tmp/
+.claude/
+.codegraph/
+.meta-kim/
+public/imports/
+tools/__pycache__/

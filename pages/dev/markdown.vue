@@ -42,25 +42,21 @@
 </template>
 
 <script setup lang="ts">
-import TurndownService from 'turndown';
+import { createMarkdownTurndownService, postProcessMarkdown } from '#shared/utils/markdown';
 import { Exporter } from '~/utils/download/Exporter';
 
 const htmlCode = ref('<h1>Hello World</h1><p>This is a <strong>bold</strong> paragraph.</p>');
 const mdCode = ref('');
 
 // 初始化 Turndown 服务
-const turndownService = new TurndownService({
-  headingStyle: 'atx', // 标题样式：atx (# Heading) 或 setext (H1\n===)
-  bulletListMarker: '-', // 无序列表标记
-  codeBlockStyle: 'fenced', // 代码块样式：fenced (```) 或 indented
-});
+const turndownService = createMarkdownTurndownService();
 
 // 监听 HTML 变化，实时转换为 Markdown
 watch(
   htmlCode,
   newVal => {
     if (newVal) {
-      mdCode.value = turndownService.turndown(newVal);
+      mdCode.value = postProcessMarkdown(turndownService.turndown(newVal));
     }
   },
   { immediate: true }

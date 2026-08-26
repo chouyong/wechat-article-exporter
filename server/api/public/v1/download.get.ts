@@ -1,6 +1,6 @@
-import TurndownService from 'turndown';
 import { urlIsValidMpArticle } from '#shared/utils';
 import { normalizeHtml, parseCgiDataNew } from '#shared/utils/html';
+import { createMarkdownTurndownService, postProcessMarkdown } from '#shared/utils/markdown';
 import { USER_AGENT } from '~/config';
 
 interface SearchBizQuery {
@@ -63,7 +63,7 @@ export default defineEventHandler(async event => {
         },
       });
     case 'markdown':
-      return new Response(new TurndownService().turndown(normalizeHtml(rawHtml, 'html')), {
+      return new Response(postProcessMarkdown(createMarkdownTurndownService().turndown(normalizeHtml(rawHtml, 'html'))), {
         status: 200,
         headers: {
           'Content-Type': 'text/markdown; charset=UTF-8',
