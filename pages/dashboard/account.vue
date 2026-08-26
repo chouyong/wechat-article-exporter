@@ -45,6 +45,11 @@ const toast = toastFactory();
 const modal = useModal();
 const { checkLogin } = useLoginCheck();
 const route = useRoute();
+const loginAccount = useLoginAccount();
+
+function openLoginModal() {
+  modal.open(LoginModal);
+}
 
 const { getSyncTimestamp, getSyncRangeLabel, isSyncAll } = useSyncDeadline();
 const syncToTimestamp = getSyncTimestamp();
@@ -499,6 +504,36 @@ function exportAccount() {
   }
 }
 
+// 将当前浏览器 IndexedDB 中的全部账号同步到生产注册表；3001 旧实例通过本机 CORS 写入 3002。
+const productionImportLoading = ref(false);
+async function syncAllAccountsToProduction() {
+  if (productionImportLoading.value) return;
+  productionImportLoading.value = true;
+  try {
+    const accounts = await getAllInfo();
+    if (accounts.length === 0) {
+      toast.error('账号同步失败', '当前浏览器账号表为空，请先登录并确认公众号列表已加载。');
+      return;
+    }
+    const target = window.location.port === '3001' ? 'http://127.0.0.1:3002' : '';
+    const response = await fetch(`${target}/api/tools/mp-accounts/import-browser`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ accounts, dryRun: false }),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.statusMessage || result.message || `HTTP ${response.status}`);
+    toast.success(
+      '账号同步完成',
+      `浏览器发现 ${result.unique ?? accounts.length} 个唯一账号；新增 ${result.inserted ?? 0}，更新 ${result.updated ?? 0}，不变 ${result.unchanged ?? 0}。`
+    );
+  } catch (error) {
+    toast.error('账号同步失败', (error as Error).message);
+  } finally {
+    productionImportLoading.value = false;
+  }
+}
+
 const { getActualDateRange } = useSyncDeadline();
 
 onMounted(async () => {
@@ -521,6 +556,14 @@ onMounted(async () => {
     <div class="flex flex-col h-full divide-y divide-gray-200">
       <!-- 顶部操作区 -->
       <header class="flex items-stretch gap-3 px-3 py-3">
+        <UButton
+          icon="i-lucide:qr-code"
+          color="gray"
+          variant="solid"
+          @click="openLoginModal"
+        >
+          {{ loginAccount ? '重新扫码登录' : '登录公众号' }}
+        </UButton>
         <UButton icon="i-lucide:user-plus" color="blue" :disabled="isDeleting || addBtnLoading" @click="addAccount">
           {{ addBtnLoading ? '添加中...' : '添加' }}
         </UButton>
@@ -539,6 +582,14 @@ onMounted(async () => {
           @click="exportAccount"
         >
           批量导出
+        </UButton>
+        <UButton
+          icon="i-lucide:database-zap"
+          color="violet"
+          :loading="productionImportLoading"
+          @click="syncAllAccountsToProduction"
+        >
+          全部账号入生产
         </UButton>
         <UButton
           color="rose"

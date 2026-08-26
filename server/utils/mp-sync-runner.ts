@@ -1,31 +1,32 @@
 // 相对 import 带 .ts 扩展：既让离线 smoke 在裸 Node ESM 下能直接 import（Node 类型剥离要求显式扩展），
 // 也被 Nitro 打包（rollup/esbuild，不做 tsc 类型检查）正常解析。避免 ~ 别名导致 smoke 无法解析。
+
 import {
-  syncSingleAccount,
-  SyncConfigError,
-  SyncFetchError,
-  isRetryableErrorKind,
-  type PageFetcher,
-  type SyncAccountOptions,
-  type AccountSyncOutcome,
-  type SyncErrorKind,
-} from './mp-sync-service.ts';
-import {
-  startJob,
-  listJobAccounts,
-  markAccountRunning,
+  type AccountOutcomeInput,
   applyAccountOutcome,
-  finalizeJob,
   cancelPendingAccounts,
+  finalizeJob,
   isCancelRequested,
-  reconcileOrphanedJobs,
-  resetInterruptedAccounts,
-  prepareFailedRetry,
+  listJobAccounts,
   listRunningJobIdsForRecovery,
   type MpSyncJob,
   type MpSyncJobAccount,
-  type AccountOutcomeInput,
+  markAccountRunning,
+  prepareFailedRetry,
+  reconcileOrphanedJobs,
+  resetInterruptedAccounts,
+  startJob,
 } from './mp-sync-job-registry.ts';
+import {
+  type AccountSyncOutcome,
+  isRetryableErrorKind,
+  type PageFetcher,
+  type SyncAccountOptions,
+  SyncConfigError,
+  type SyncErrorKind,
+  SyncFetchError,
+  syncSingleAccount,
+} from './mp-sync-service.ts';
 
 /**
  * C3-1 后台同步 runner **核心循环**（A 类·纯离线：注入 PageFetcher + 临时 SQLite，可离线全验）。
@@ -61,14 +62,13 @@ export interface AccountRunResult {
   /** isRetryableErrorKind(errorKind) 的结果；succeeded / 未知 / config_error 均为 false（fail-closed）。 */
   retryable: boolean;
   errorMessage: string | null;
+  lastArticleTime: number | null;
   /** C3-3 观测：本账号实际尝试次数（含首次）；由 runWithRetry 填充，**非持久**、仅观测。 */
   attempts?: number;
 }
 
 /** classifyAccountResult 的输入：要么是 service 返回的 outcome，要么是 service 抛出的错误。 */
-export type RawAccountResult =
-  | { ok: true; outcome: AccountSyncOutcome }
-  | { ok: false; error: unknown };
+export type RawAccountResult = { ok: true; outcome: AccountSyncOutcome } | { ok: false; error: unknown };
 
 /**
  * 纯函数：把「一次账号尝试的原始结果」翻译成 (a) 落库入参 AccountOutcomeInput 与 (b) 观测摘要 AccountRunResult。
@@ -98,7 +98,15 @@ export function classifyAccountResult(
           errorCode: null,
           errorMessage: null,
         },
-        run: { fakeid, status: 'succeeded', newArticles, errorKind: null, retryable: false, errorMessage: null },
+        run: {
+          fakeid,
+          status: 'succeeded',
+          newArticles,
+          errorKind: null,
+          retryable: false,
+          errorMessage: null,
+          lastArticleTime: outcome.lastArticleTime,
+        },
       };
     }
 
@@ -116,7 +124,15 @@ export function classifyAccountResult(
         errorCode: errorKind ?? outcome.errorCode ?? null,
         errorMessage,
       },
-      run: { fakeid, status: outcome.status, newArticles, errorKind, retryable, errorMessage },
+      run: {
+        fakeid,
+        status: outcome.status,
+        newArticles,
+        errorKind,
+        retryable,
+        errorMessage,
+        lastArticleTime: outcome.lastArticleTime,
+      },
     };
   }
 
@@ -135,6 +151,7 @@ export function classifyAccountResult(
         errorKind: error.kind,
         retryable: isRetryableErrorKind(error.kind),
         errorMessage,
+        lastArticleTime: null,
       },
     };
   }
@@ -143,7 +160,15 @@ export function classifyAccountResult(
   const errorMessage = error instanceof Error ? error.message : String(error);
   return {
     outcomeInput: { status: 'failed', newArticles: 0, errorCode: 'unexpected_error', errorMessage },
-    run: { fakeid, status: 'failed', newArticles: 0, errorKind: null, retryable: false, errorMessage },
+    run: {
+      fakeid,
+      status: 'failed',
+      newArticles: 0,
+      errorKind: null,
+      retryable: false,
+      errorMessage,
+      lastArticleTime: null,
+    },
   };
 }
 
@@ -156,7 +181,10 @@ export interface RunSyncJobDeps {
    * 中 Omit 掉；即便调用方经非类型安全输入塞入 startBegin，runner 也在展开后固定 0 覆盖（运行时第二层防御）。
    * 生产默认不传，走 service 默认（pageSize=20 / maxPages=500）。离线测试用它触发真实通道 A/B，不桩掉 service。
    */
-  resolveOptions?: (account: MpSyncJobAccount, job: MpSyncJob) => Partial<Omit<SyncAccountOptions, 'fakeid' | 'startBegin'>>;
+  resolveOptions?: (
+    account: MpSyncJobAccount,
+    job: MpSyncJob
+  ) => Partial<Omit<SyncAccountOptions, 'fakeid' | 'startBegin'>>;
   /**
    * C3-3：注入时钟，退避 sleep 与 per-page timeout 均经此。默认 `createRealClock()`（Date.now + setTimeout）。
    * 离线测试注入逻辑时钟（smoke `createManualClock`）以零真实等待、确定性推进退避/超时时序。
@@ -181,6 +209,14 @@ export interface RunSyncJobDeps {
    * 否则被 `cancelPendingAccounts` 的 P3 前置拦截（见 runSyncJobPool §④ 收口 + smoke G9a fixture 不变量）。
    */
   isCancelRequested?: (jobId: string) => boolean;
+  /** 生产提交屏障：在 job finalize 前执行；抛错时 job 保持 running，交恢复路径处理。 */
+  beforeFinalize?: (jobId: string) => void | Promise<void>;
+  /** 接收 service 最终去重后的文章；不得从分页 fetcher 旁路收集全量页面。 */
+  onArticles?: (
+    jobId: string,
+    fakeid: string,
+    articles: AccountSyncOutcome['newArticles']
+  ) => void | Promise<void>;
 }
 
 export interface RunSyncJobResult {
@@ -231,7 +267,7 @@ async function processAccount(
   const timeoutFetchPage =
     ctx.timeoutMs === undefined ? deps.fetchPage : withTimeout(deps.fetchPage, ctx.clock, ctx.timeoutMs);
 
-  const { outcomeInput, run } = await runWithRetry(
+  const { outcomeInput, run, newArticles } = await runWithRetry(
     account.fakeid,
     options,
     timeoutFetchPage,
@@ -240,6 +276,7 @@ async function processAccount(
     emitSignal
   );
 
+  await deps.onArticles?.(jobId, account.fakeid, newArticles);
   applyAccountOutcome(jobId, account.fakeid, outcomeInput); // 循环后只调一次（最终 outcome）
   return run;
 }
@@ -274,6 +311,7 @@ export async function runSyncJob(jobId: string, deps: RunSyncJobDeps): Promise<R
   // cancel 已到达（含循环 break 提前退出、或最后一个账号完成后 cancel 到达）→ 剩余 pending 落 cancelled。
   // P3 门：probe 为默认实现时 cancel_requested_at 已非空；无剩余 pending 时 cancelPendingAccounts 返回 0（F-C2-2）。
   if (probe(jobId)) cancelPendingAccounts(jobId);
+  await deps.beforeFinalize?.(jobId);
   const finalJob = finalizeJob(jobId); // cancelRequestedAt 非空 → cancelled
   return { job: finalJob, accounts }; // push 累积，天然无空洞（P1 不涉及顺序版）
 }
@@ -327,7 +365,7 @@ export class ConcurrencyController {
   constructor(options: ConcurrencyControllerOptions = {}) {
     const levels = options.levels ?? DEFAULT_CONCURRENCY_LEVELS;
     if (levels.length === 0) throw new RangeError('ConcurrencyController: levels 不能为空');
-    if (!levels.every((n) => Number.isSafeInteger(n) && n > 0)) {
+    if (!levels.every(n => Number.isSafeInteger(n) && n > 0)) {
       throw new RangeError('ConcurrencyController: levels 必须均为安全正整数');
     }
     for (let i = 1; i < levels.length; i += 1) {
@@ -446,7 +484,7 @@ async function runSyncJobPoolResolved(
   const controller = new ConcurrencyController(options);
   // C3-3/§2.5：升降档信号下沉为 per-attempt——runWithRetry 每 attempt 恰调一次 emitSignal；据此移除下方
   // 完成回调里原“每账号一次 onResult”（原 :392），改由此闭包在每次 attempt 把信号转发给控制器。
-  const emitSignal: (signal: ConcurrencySignal) => void = (signal) => controller.onResult(signal);
+  const emitSignal: (signal: ConcurrencySignal) => void = signal => controller.onResult(signal);
 
   let nextIndex = 0;
   let inFlight = 0;
@@ -501,13 +539,13 @@ async function runSyncJobPoolResolved(
           schedule.push({ limit: controller.currentLimit(), inFlight });
 
           processAccount(jobId, account, job, deps, ctx, emitSignal).then(
-            (run) => {
+            run => {
               inFlight -= 1;
               accounts[index] = run;
               // onResult 已在 runWithRetry 内 per-attempt 经 emitSignal 调用（§2.5）；此处不再重复。
               pump();
             },
-            (err) => {
+            err => {
               inFlight -= 1;
               // 记录首个系统故障；err 原样保留（含 null）待 settle 时透传，绝不据其取值判断是否故障。
               if (!hasFatalError) {
@@ -534,6 +572,7 @@ async function runSyncJobPoolResolved(
   // cancelRequested ⟹ cancel_requested_at 非空；测试须先真实 requestCancel 建同一真库标记，见 smoke G9a
   // fixture 不变量）。
   if (cancelRequested) cancelPendingAccounts(jobId);
+  await deps.beforeFinalize?.(jobId);
   const finalJob = finalizeJob(jobId); // cancelRequestedAt 非空 → cancelled；否则按四态收口
   // P1：压实稀疏缓冲为纯 AccountRunResult[]（无空洞、保持 pending 相对顺序）。非 cancel 非 fatal 路径所有槽位
   // 填满 → filter 为 no-op（同序同内容，锁 236 回归）；cancel 路径未 admit 槽位为空洞 → 被剔除 → accounts 只含
@@ -707,10 +746,7 @@ function resolveRetryContext(deps: RunSyncJobDeps): ResolvedRetryContext {
  * 指数封顶 min(attempt,30) 是硬约束：防 attempt 大到 2**attempt=Infinity 时 base=0 触发 0*Infinity=NaN
  * （cap=30 时 2**30≈1.07e9 恒有限 → base=0 时 raw 恒 0、base>0 时被 maxDelayMs 封顶）。
  */
-export function computeRawBackoff(
-  attempt: number,
-  opts: { baseDelayMs?: number; maxDelayMs?: number } = {}
-): number {
+export function computeRawBackoff(attempt: number, opts: { baseDelayMs?: number; maxDelayMs?: number } = {}): number {
   const base = opts.baseDelayMs ?? DEFAULT_BASE_DELAY_MS;
   const max = opts.maxDelayMs ?? DEFAULT_MAX_DELAY_MS;
   return Math.min(max, base * 2 ** Math.min(attempt, 30));
@@ -746,7 +782,7 @@ export function computeBackoffDelay(attempt: number, opts: RetryPolicyOptions = 
  * 兜底 api_error 不可重试）——**非** runner fatal/drain。
  */
 export function withTimeout(fetchPage: PageFetcher, clock: RunnerClock, timeoutMs: number): PageFetcher {
-  return (params) => {
+  return params => {
     const ac = new AbortController();
     const fetchP = Promise.resolve().then(() => fetchPage(params));
     const timeoutP = Promise.resolve()
@@ -764,6 +800,7 @@ export function withTimeout(fetchPage: PageFetcher, clock: RunnerClock, timeoutM
 interface RunWithRetryResult {
   outcomeInput: AccountOutcomeInput;
   run: AccountRunResult;
+  newArticles: AccountSyncOutcome['newArticles'];
 }
 
 /**
@@ -806,7 +843,11 @@ async function runWithRetry(
       !classified.run.retryable || // 不可重试（含 config_error / api_error / 未预期）→ 终态
       attempts >= retry.maxAttempts // 耗尽 → 终态
     ) {
-      return { outcomeInput: classified.outcomeInput, run: { ...classified.run, attempts } };
+      return {
+        outcomeInput: classified.outcomeInput,
+        run: { ...classified.run, attempts },
+        newArticles: raw.ok ? raw.outcome.newArticles : [],
+      };
     }
     await clock.sleep(computeBackoffDelay(attempt, retry)); // 退避（槽位保持，§2.6）；sleep/jitter 抛错向上传
     attempt = attempts;
@@ -861,7 +902,17 @@ export interface RecoverySummary {
  * **单 job fatal 不阻断全局（§5-P4）**：逐 job try/catch——单 job fatal 记录进 summary.failed（不吞成成功、
  * 不伪装账号 failed/cancelled），该 job 保持 running（未 finalize）交下次 reconcile，继续恢复下一个 job。
  */
-export async function recoverInterruptedJobs(deps: RunSyncJobDeps): Promise<RecoverySummary> {
+export interface RecoveryHooks {
+  /** 在单个 job 恢复前调用；生产接线用它把 fetchPage 产物归属到当前 job。 */
+  onJobStart?: (jobId: string) => void | Promise<void>;
+  /** job 状态收口后调用；hook 失败按该 job fatal 处理并保持 fail-closed。 */
+  onJobComplete?: (jobId: string, outcome: 'recovered' | 'cancelled') => void | Promise<void>;
+}
+
+export async function recoverInterruptedJobs(
+  deps: RunSyncJobDeps,
+  hooks: RecoveryHooks = {}
+): Promise<RecoverySummary> {
   // 启动屏障：全局 running 账号 -> interrupted（job 仍 running）。本次 invocation 内 reconcile 恰一次、
   // 先于任何 job admission（快照枚举与逐 job 恢复都在其后）。
   const reconciled = reconcileOrphanedJobs();
@@ -870,7 +921,9 @@ export async function recoverInterruptedJobs(deps: RunSyncJobDeps): Promise<Reco
   // listRunningJobIdsForRecovery）；created_at ASC, id ASC 全序。
   for (const jobId of listRunningJobIdsForRecovery()) {
     try {
+      await hooks.onJobStart?.(jobId);
       const outcome = await recoverOneJob(jobId, deps);
+      await hooks.onJobComplete?.(jobId, outcome);
       if (outcome === 'cancelled') summary.cancelled.push(jobId);
       else summary.recovered.push(jobId);
     } catch (error) {

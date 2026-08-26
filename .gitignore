@@ -38,3 +38,6 @@ tmp/
 .meta-kim/
 public/imports/
 tools/__pycache__/
+
+# Local structural indexes
+graphify-out/
