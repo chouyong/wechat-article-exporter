@@ -463,3 +463,31 @@ export function exportMpAccounts() {
   const rows = db.prepare('SELECT * FROM mp_accounts ORDER BY priority DESC, fakeid').all() as SqliteRow[];
   return rows.map(fromRow);
 }
+
+/** 后台同步完成后更新账号水位；只接受 runner 已落定的成功/失败摘要。 */
+export function recordMpAccountSyncResult(input: {
+  fakeid: string;
+  status: 'succeeded' | 'failed' | 'auth_required';
+  lastArticleTime?: number | null;
+  errorCode?: string | null;
+  errorMessage?: string | null;
+}) {
+  const db = getDatabase();
+  const now = new Date().toISOString();
+  const success = input.status === 'succeeded';
+  db.prepare(
+    `UPDATE mp_accounts SET last_article_time = COALESCE(?, last_article_time), last_synced_at = ?, last_success_at = CASE WHEN ? THEN ? ELSE last_success_at END, last_error_code = CASE WHEN ? THEN NULL ELSE ? END, last_error_message = CASE WHEN ? THEN NULL ELSE ? END, consecutive_failures = CASE WHEN ? THEN 0 ELSE consecutive_failures + 1 END, updated_at = ? WHERE fakeid = ?`
+  ).run(
+    input.lastArticleTime ?? null,
+    now,
+    success ? 1 : 0,
+    success ? now : null,
+    success ? 1 : 0,
+    input.errorCode ?? null,
+    success ? 1 : 0,
+    input.errorMessage ?? null,
+    success ? 1 : 0,
+    now,
+    input.fakeid.trim()
+  );
+}

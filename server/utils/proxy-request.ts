@@ -1,8 +1,9 @@
 import dayjs from 'dayjs';
-import { H3Event, parseCookies } from 'h3';
+import type { H3Event } from 'h3';
+import { parseCookies } from 'h3';
 import { v4 as uuidv4 } from 'uuid';
 import { isDev, USER_AGENT } from '~/config';
-import { RequestOptions } from '~/server/types';
+import type { RequestOptions } from '~/server/types';
 import { cookieStore, getCookieFromStore } from '~/server/utils/CookieStore';
 import { logRequest, logResponse } from '~/server/utils/logger';
 
@@ -85,12 +86,10 @@ export async function proxyMpRequest(options: RequestOptions) {
         throw new Error(`redirect_url 中未找到 token 参数: ${redirectUrl}`);
       }
 
-      console.log('token', token);
       const success = await cookieStore.setCookie(authKey, token, mpResponse.headers.getSetCookie());
       if (!success) {
         throw new Error('cookie 写入 KV 存储失败');
       }
-      console.log('cookie 写入成功');
 
       setCookies = [
         `auth-key=${authKey}; Path=/; Expires=${dayjs().add(4, 'days').toString()}; Secure; HttpOnly`,
@@ -99,10 +98,10 @@ export async function proxyMpRequest(options: RequestOptions) {
         `uuid=EXPIRED; Path=/; Expires=${dayjs().subtract(1, 'days').toString()}; Secure; HttpOnly`,
       ];
     } catch (error) {
-      console.error('action(login) failed:', error);
+      console.error('action(login) failed:', error instanceof Error ? error.name : 'unknown_error');
 
       // 登录失败时返回错误响应，而不是静默继续
-      return new Response(JSON.stringify({ base_resp: { ret: -1, err_msg: `登录处理失败: ${error}` } }), {
+      return new Response(JSON.stringify({ base_resp: { ret: -1, err_msg: '登录处理失败' } }), {
         status: 500,
         headers: { 'Content-Type': 'application/json' },
       });

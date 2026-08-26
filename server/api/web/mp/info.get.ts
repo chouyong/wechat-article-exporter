@@ -8,6 +8,26 @@
 import { getTokenFromStore } from '~/server/utils/CookieStore';
 import { proxyMpRequest } from '~/server/utils/proxy-request';
 
+function extractAccountField(html: string, names: string[]): string {
+  // 微信页面在不同版本中会返回 JS 赋值、JSON 或 HTML 转义的 JSON。
+  const normalized = html
+    .replaceAll('&quot;', '"')
+    .replaceAll('&#39;', "'")
+    .replaceAll('\\\\"', '"');
+  const field = names.join('|');
+  const patterns = [
+    new RegExp(`(?:wx\\.cgiData\\.)?(?:${field})\\s*=\\s*["']([^"']+)["']`, 'i'),
+    new RegExp(`["'](?:${field})["']\\s*:\\s*["']([^"']+)["']`, 'i'),
+    new RegExp(`\\b(?:${field})\\b\\s*[:=]\\s*["']([^"']+)["']`, 'i'),
+  ];
+
+  for (const pattern of patterns) {
+    const match = normalized.match(pattern);
+    if (match?.[1]) return match[1];
+  }
+  return '';
+}
+
 export default defineEventHandler(async event => {
   const token = await getTokenFromStore(event);
   if (!token) {
@@ -25,19 +45,8 @@ export default defineEventHandler(async event => {
     },
   }).then(resp => resp.text());
 
-  // 提取昵称
-  let nick_name = '';
-  const nicknameMatchResult = html.match(/wx\.cgiData\.nick_name\s*?=\s*?"(?<nick_name>[^"]+)"/);
-  if (nicknameMatchResult && nicknameMatchResult.groups && nicknameMatchResult.groups.nick_name) {
-    nick_name = nicknameMatchResult.groups.nick_name;
-  }
-
-  // 提取头像
-  let head_img = '';
-  const headImgMatchResult = html.match(/wx\.cgiData\.head_img\s*?=\s*?"(?<head_img>[^"]+)"/);
-  if (headImgMatchResult && headImgMatchResult.groups && headImgMatchResult.groups.head_img) {
-    head_img = headImgMatchResult.groups.head_img;
-  }
+  const nick_name = extractAccountField(html, ['nick_name', 'nickname']);
+  const head_img = extractAccountField(html, ['head_img', 'headImg', 'avatar']);
 
   return {
     nick_name: nick_name,

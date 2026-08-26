@@ -1,5 +1,7 @@
-import { H3Event, parseCookies } from 'h3';
-import { CookieKVValue, getMpCookie, setMpCookie } from '~/server/kv/cookie';
+import type { H3Event } from 'h3';
+import { parseCookies } from 'h3';
+import type { CookieKVValue } from '~/server/kv/cookie';
+import { getMpCookie, setMpCookie } from '~/server/kv/cookie';
 
 // 表示一条 set-cookie 记录的解析结果
 export type CookieEntity = Record<string, string | number>;
@@ -8,18 +10,20 @@ export type CookieEntity = Record<string, string | number>;
 export class AccountCookie {
   private readonly _token: string;
   private _cookie: CookieEntity[];
+  private readonly _expiresAt?: string;
 
   /**
    * @param token
    * @param cookies response.headers.getSetCookie() 的结果，是一个字符串数组
    */
-  constructor(token: string, cookies: string[]) {
+  constructor(token: string, cookies: string[], expiresAt?: string) {
     this._token = token;
     this._cookie = AccountCookie.parse(cookies);
+    this._expiresAt = expiresAt;
   }
 
-  static create(token: string, cookies: CookieEntity[]): AccountCookie {
-    const value = new AccountCookie(token, []);
+  static create(token: string, cookies: CookieEntity[], expiresAt?: string): AccountCookie {
+    const value = new AccountCookie(token, [], expiresAt);
     value._cookie = cookies;
     return value;
   }
@@ -32,6 +36,7 @@ export class AccountCookie {
     return {
       token: this._token,
       cookies: this._cookie,
+      expiresAt: this._expiresAt,
     };
   }
 
@@ -45,8 +50,16 @@ export class AccountCookie {
 
   // 根据 cookie 中的 expires 来确定是否已过期
   public get isExpired(): boolean {
-    // todo
-    return false;
+    if (this._expiresAt && Date.parse(this._expiresAt) <= Date.now()) return true;
+
+    // 微信登录响应通常会同时返回清理旧 Cookie 的 `EXPIRED` 项；
+    // 单个删除项过期不代表整套登录凭据失效。只有所有可发送的 Cookie
+    // 都明确过期时，才将凭据判定为失效。
+    const activeCookies = this._cookie.filter(cookie => cookie.value && cookie.value !== 'EXPIRED');
+    if (activeCookies.length === 0) return true;
+    return activeCookies.every(
+      cookie => typeof cookie.expires_timestamp === 'number' && cookie.expires_timestamp <= Date.now()
+    );
   }
 
   public static parse(cookies: string[]): CookieEntity[] {
@@ -120,6 +133,11 @@ class CookieStore {
     let cachedAccountCookie = this.store.get(authKey);
 
     if (cachedAccountCookie) {
+      if (cachedAccountCookie.isExpired) {
+        this.store.delete(authKey);
+        this.removePersistentCookieSafe(authKey);
+        return null;
+      }
       // LRU: 访问时将条目移到末尾（最近使用）
       this.store.delete(authKey);
       this.store.set(authKey, cachedAccountCookie);
@@ -132,7 +150,11 @@ class CookieStore {
       return null;
     }
 
-    cachedAccountCookie = AccountCookie.create(cookieValue.token, cookieValue.cookies);
+    cachedAccountCookie = AccountCookie.create(cookieValue.token, cookieValue.cookies, cookieValue.expiresAt);
+    if (cachedAccountCookie.isExpired) {
+      await this.removePersistentCookie(authKey);
+      return null;
+    }
     this.evictIfNeeded();
     this.store.set(authKey, cachedAccountCookie);
 
@@ -159,7 +181,11 @@ class CookieStore {
    * @param cookie 原始的 set-cookie 字符串数组
    */
   async setCookie(authKey: string, token: string, cookie: string[]): Promise<boolean> {
-    const accountCookie = new AccountCookie(token, cookie);
+    const accountCookie = new AccountCookie(
+      token,
+      cookie,
+      new Date(Date.now() + 4 * 24 * 60 * 60 * 1000).toISOString()
+    );
     // 如果已存在则先删除（保证 LRU 顺序正确）
     this.store.delete(authKey);
     this.evictIfNeeded();
@@ -173,6 +199,18 @@ class CookieStore {
    */
   removeCookie(authKey: string): void {
     this.store.delete(authKey);
+    this.removePersistentCookieSafe(authKey);
+  }
+
+  private removePersistentCookieSafe(authKey: string): void {
+    void this.removePersistentCookie(authKey).catch(error => {
+      console.error('cookie persistent delete failed:', error instanceof Error ? error.name : 'unknown_error');
+    });
+  }
+
+  private async removePersistentCookie(authKey: string) {
+    const { deleteMpCookie } = await import('~/server/kv/cookie');
+    await deleteMpCookie(authKey);
   }
 
   /**
