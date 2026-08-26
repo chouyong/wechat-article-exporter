@@ -5,12 +5,6 @@ export default defineNuxtConfig({
     enabled: false,
   },
   modules: ['@vueuse/nuxt', '@nuxt/ui', 'nuxt-monaco-editor', '@sentry/nuxt/module', 'nuxt-umami'],
-  imports: {
-    imports: [
-      { name: 'useModal', from: '#ui/composables/useModal' },
-      { name: 'useToast', from: '#ui/composables/useToast' },
-    ],
-  },
   ssr: false,
   runtimeConfig: {
     public: {
