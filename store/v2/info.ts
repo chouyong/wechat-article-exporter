@@ -1,7 +1,10 @@
+import { getCurrentAccountOwnerKey } from '#shared/utils/account-session';
 import { db } from './db';
 
 export interface MpAccount {
   fakeid: string;
+  /** 登录公众号身份的本地缓存作用域；防止切换账号后复用旧账号列表。 */
+  ownerKey?: string;
   completed: boolean;
   count: number;
   articles: number;
@@ -25,8 +28,16 @@ export interface MpAccount {
  * @param mpAccount
  */
 export async function updateInfoCache(mpAccount: MpAccount): Promise<boolean> {
+  const ownerKey = getCurrentAccountOwnerKey();
+  if (!ownerKey) return false;
+
   return db.transaction('rw', 'info', async () => {
     let infoCache = await db.info.get(mpAccount.fakeid);
+    // 带有 ownerKey 的缓存行属于另一个登录主体时，只允许当前主体通过
+    // “明确重新添加”流程接管无 ownerKey 的输入；旧主体的行不能继续写入。
+    if (infoCache?.ownerKey && infoCache.ownerKey !== ownerKey && mpAccount.ownerKey) {
+      return false;
+    }
     if (infoCache) {
       if (mpAccount.completed) {
         infoCache.completed = mpAccount.completed;
@@ -36,10 +47,12 @@ export async function updateInfoCache(mpAccount: MpAccount): Promise<boolean> {
       infoCache.nickname = mpAccount.nickname;
       infoCache.round_head_img = mpAccount.round_head_img;
       infoCache.total_count = mpAccount.total_count;
+      infoCache.ownerKey = ownerKey;
       infoCache.update_time = Math.round(Date.now() / 1000);
     } else {
       infoCache = {
         fakeid: mpAccount.fakeid,
+        ownerKey,
         completed: mpAccount.completed,
         count: mpAccount.count,
         articles: mpAccount.articles,
@@ -56,9 +69,12 @@ export async function updateInfoCache(mpAccount: MpAccount): Promise<boolean> {
 }
 
 export async function updateLastUpdateTime(fakeid: string): Promise<boolean> {
+  const ownerKey = getCurrentAccountOwnerKey();
+  if (!ownerKey) return false;
+
   return db.transaction('rw', 'info', async () => {
     let infoCache = await db.info.get(fakeid);
-    if (infoCache) {
+    if (infoCache?.ownerKey === ownerKey) {
       infoCache.last_update_time = Math.round(Date.now() / 1000);
       db.info.put(infoCache);
     }
@@ -71,11 +87,17 @@ export async function updateLastUpdateTime(fakeid: string): Promise<boolean> {
  * @param fakeid
  */
 export async function getInfoCache(fakeid: string): Promise<MpAccount | undefined> {
-  return db.info.get(fakeid);
+  const ownerKey = getCurrentAccountOwnerKey();
+  if (!ownerKey) return undefined;
+  const infoCache = await db.info.get(fakeid);
+  return infoCache?.ownerKey === ownerKey ? infoCache : undefined;
 }
 
 export async function getAllInfo(): Promise<MpAccount[]> {
-  return db.info.toArray();
+  const ownerKey = getCurrentAccountOwnerKey();
+  if (!ownerKey) return [];
+  const infos = await db.info.toArray();
+  return infos.filter(info => info.ownerKey === ownerKey);
 }
 
 // 获取公众号的名称

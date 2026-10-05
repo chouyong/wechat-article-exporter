@@ -11,6 +11,8 @@ import type {
 } from 'ag-grid-community';
 import { AgGridVue } from 'ag-grid-vue3';
 import { defu } from 'defu';
+import { createAccountOwnerKey, setCurrentAccountOwnerKey } from '#shared/utils/account-session';
+import { formatAccountSyncError, runAccountSyncBatch } from '#shared/utils/account-sync';
 import { formatTimeStamp, sleep } from '#shared/utils/helpers';
 import { stripImportedFromQuery } from '#shared/utils/mp-account-import';
 import { getArticleList } from '~/apis';
@@ -74,12 +76,17 @@ function addAccount() {
 }
 async function onSelectAccount(account: MpAccount) {
   addBtnLoading.value = true;
-  await loadAccountArticle(account, false);
-  await refresh();
-  addBtnLoading.value = false;
-  toast.success('公众号添加成功', `已成功添加公众号【${account.nickname}】，并同步了第一页的文章数据`);
-  // 通知 Credentials 面板按钮立即变更为“已添加”
-  accountEventBus.emit('account-added', { fakeid: account.fakeid });
+  try {
+    await loadAccountArticle(account, false);
+    await refresh();
+    toast.success('公众号添加成功', `已成功添加公众号【${account.nickname}】，并同步了第一页的文章数据`);
+    // 通知 Credentials 面板按钮立即变更为“已添加”
+    accountEventBus.emit('account-added', { fakeid: account.fakeid });
+  } catch (error) {
+    toast.error('公众号添加失败', formatAccountSyncError(error));
+  } finally {
+    addBtnLoading.value = false;
+  }
 }
 
 // 表示同步过程中是否执行了取消操作
@@ -88,7 +95,6 @@ const isDeleting = ref(false);
 const isSyncing = ref(false);
 
 const syncingRowIds = ref<string[]>([]);
-const ACCOUNT_SYNC_CONCURRENCY = 4;
 
 function markAccountSyncing(fakeid: string) {
   if (!syncingRowIds.value.includes(fakeid)) {
@@ -171,22 +177,6 @@ async function loadAccountArticle(account: MpAccount, loadMore = true) {
   });
 }
 
-async function runAccountSyncBatch(accounts: MpAccount[], concurrency: number) {
-  const queue = [...accounts];
-  const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
-    while (queue.length > 0) {
-      if (isCanceled.value) {
-        throw new Error('已取消同步');
-      }
-      const account = queue.shift();
-      if (!account) return;
-      await loadAccountArticle(account);
-    }
-  });
-
-  await Promise.all(workers);
-}
-
 // 同步所有公众号
 async function loadSelectedAccountArticle() {
   if (!checkLogin()) return;
@@ -196,11 +186,11 @@ async function loadSelectedAccountArticle() {
 
   try {
     const rows = getSelectedRows();
-    await runAccountSyncBatch(rows, ACCOUNT_SYNC_CONCURRENCY);
+    await runAccountSyncBatch(rows, account => loadAccountArticle(account), () => isCanceled.value);
     const rangeHint = isSyncAll() ? '' : `（同步范围：${getSyncRangeLabel()}）`;
     toast.success('同步完成', `已成功同步 ${rows.length} 个公众号${rangeHint}`);
   } catch (e: any) {
-    toast.error('同步失败', e.message);
+    toast.error('同步失败', formatAccountSyncError(e));
   } finally {
     isSyncing.value = false;
     syncingRowIds.value = [];
@@ -209,6 +199,8 @@ async function loadSelectedAccountArticle() {
 }
 
 let globalRowData: MpAccount[] = [];
+// 当前是否有选中的行
+const hasSelectedRows = ref(false);
 
 const columnDefs = ref<ColDef[]>([
   {
@@ -339,7 +331,7 @@ const columnDefs = ref<ColDef[]>([
             toast.success('同步完成', `公众号【${params.data.nickname}】的文章已同步完毕${rangeHint}`);
           })
           .catch(e => {
-            toast.error('同步失败', e.message);
+            toast.error('同步失败', formatAccountSyncError(e));
           });
       },
       onStop: (_params: ICellRendererParams) => {
@@ -397,6 +389,18 @@ async function refresh() {
   gridApi.value?.setGridOption('rowData', globalRowData);
 }
 
+// 登录身份切换后立即切换本地缓存作用域，避免把旧账号的 fakeid 交给新会话同步。
+watch(
+  loginAccount,
+  async account => {
+    setCurrentAccountOwnerKey(account ? createAccountOwnerKey(account) : null);
+    hasSelectedRows.value = false;
+    gridApi.value?.deselectAll();
+    await refresh();
+  },
+  { immediate: true }
+);
+
 async function updateRow(fakeid: string) {
   const rowNode = gridApi.value?.getRowNode(fakeid);
   if (rowNode) {
@@ -405,8 +409,6 @@ async function updateRow(fakeid: string) {
   }
 }
 
-// 当前是否有选中的行
-const hasSelectedRows = ref(false);
 function onSelectionChanged(evt: SelectionChangedEvent) {
   hasSelectedRows.value = (evt.selectedNodes?.map(node => node.data) || []).length > 0;
 }

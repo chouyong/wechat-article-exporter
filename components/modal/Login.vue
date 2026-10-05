@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { createAccountOwnerKey, setCurrentAccountOwnerKey } from '#shared/utils/account-session';
 import { request } from '#shared/utils/request';
 import type { LoginAccount, ScanLoginResult, StartLoginResult } from '~/types/types';
 
@@ -113,6 +114,9 @@ async function bizLogin() {
     }
 
     msg.value = '登录成功';
+    // 登录身份变化时，后续账号列表只允许读写当前身份的本地缓存作用域。
+    // 旧作用域数据保留在 IndexedDB 中，但不会再拿新会话去同步旧 fakeid。
+    setCurrentAccountOwnerKey(createAccountOwnerKey(resp));
     loginAccount.value = resp;
 
     closeModal();
