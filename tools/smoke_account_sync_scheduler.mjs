@@ -5,8 +5,15 @@ import assert from 'node:assert/strict';
 
 const mod = await import('../shared/utils/account-sync.ts');
 const session = await import('../shared/utils/account-session.ts');
-const { ACCOUNT_SYNC_CONCURRENCY, formatAccountSyncError, isFrequencyControlError, runAccountSyncBatch } = mod;
+const registration = await import('../shared/utils/account-registration.ts');
+const {
+  ACCOUNT_SYNC_CONCURRENCY,
+  formatAccountSyncError,
+  isFrequencyControlError,
+  runAccountSyncBatch,
+} = mod;
 const { createAccountOwnerKey } = session;
+const { createAccountRegistration } = registration;
 
 let passed = 0;
 function check(description, condition) {
@@ -26,6 +33,14 @@ check(
     /停止/.test(formatAccountSyncError(new Error('200013:freq control'))) &&
     /稍后/.test(formatAccountSyncError(new Error('200013:freq control')))
 );
+
+const addedAccount = createAccountRegistration({
+  fakeid: 'fakeid-new-account',
+  nickname: '一片柳',
+  round_head_img: 'https://example.com/avatar.png',
+});
+check('添加账号只生成未同步的本地登记数据', addedAccount.completed === false && addedAccount.total_count === 0);
+check('添加账号保留搜索结果的身份字段', addedAccount.fakeid === 'fakeid-new-account' && addedAccount.nickname === '一片柳');
 
 const active = new Set();
 let maxActive = 0;
