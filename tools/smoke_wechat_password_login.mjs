@@ -9,6 +9,7 @@ const {
   buildPasswordLoginPayload,
   hashWechatPassword,
   mergeCookieHeaders,
+  classifyPasswordLoginFailure,
   shouldFollowLegacyLogin,
 } = mod;
 
@@ -39,6 +40,14 @@ check('请求体密码字段是摘要', payload.pwd === hashWechatPassword('secr
 check('密码长度上限与官方流程一致', WECHAT_PASSWORD_MAX_LENGTH === 16);
 check('灰度标记为 0 时进入旧登录提交', shouldFollowLegacyLogin({ grey: 0 }) === true);
 check('非 0 灰度标记不重复提交', shouldFollowLegacyLogin({ grey: 1 }) === false);
+
+const credentialFailure = classifyPasswordLoginFailure({ base_resp: { ret: 200023, err_msg: 'acct/password error' } }, 400);
+check(
+  '账号密码错误映射为可操作的 401 提示',
+  credentialFailure.status === 401 && credentialFailure.message.includes('邮箱或微信号')
+);
+const captchaFailure = classifyPasswordLoginFailure({ base_resp: { ret: 200008, err_msg: 'verify required' } }, 400);
+check('验证码要求映射为二维码登录提示', captchaFailure.status === 409 && captchaFailure.message.includes('二维码'));
 
 const merged = mergeCookieHeaders('uuid=old; auth-key=old-key', ['uuid=new; Path=/', 'session=next; HttpOnly']);
 check('登录响应 Cookie 覆盖同名旧值并保留新值', merged === 'uuid=new; auth-key=old-key; session=next');
