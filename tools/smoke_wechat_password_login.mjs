@@ -41,7 +41,10 @@ check('密码长度上限与官方流程一致', WECHAT_PASSWORD_MAX_LENGTH === 
 check('灰度标记为 0 时进入旧登录提交', shouldFollowLegacyLogin({ grey: 0 }) === true);
 check('非 0 灰度标记不重复提交', shouldFollowLegacyLogin({ grey: 1 }) === false);
 
-const credentialFailure = classifyPasswordLoginFailure({ base_resp: { ret: 200023, err_msg: 'acct/password error' } }, 400);
+const credentialFailure = classifyPasswordLoginFailure(
+  { base_resp: { ret: 200023, err_msg: 'acct/password error' } },
+  400
+);
 check(
   '账号密码错误映射为可操作的 401 提示',
   credentialFailure.status === 401 && credentialFailure.message.includes('邮箱或微信号')

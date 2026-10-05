@@ -39,6 +39,7 @@ export async function proxyMpRequest(options: RequestOptions) {
     options.endpoint += '?' + new URLSearchParams(options.query as Record<string, string>).toString();
   }
   if (options.method === 'POST' && options.body) {
+    headers.set('Content-Type', 'application/x-www-form-urlencoded;charset=UTF-8');
     requestInit.body = new URLSearchParams(options.body as Record<string, string>).toString();
   }
 

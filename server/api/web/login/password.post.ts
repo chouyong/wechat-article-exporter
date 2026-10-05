@@ -5,6 +5,7 @@ import { getCookieFromResponse, getCookiesFromRequest } from '~/server/utils/Coo
 import { finalizeMpLoginResponse, proxyMpRequest } from '~/server/utils/proxy-request';
 import {
   buildPasswordLoginPayload,
+  classifyPasswordLoginFailure,
   mergeCookieHeaders,
   shouldFollowLegacyLogin,
 } from '~/server/utils/wechat-password-login';
@@ -65,8 +66,9 @@ export default defineEventHandler(async event => {
     .json()
     .catch(() => null);
   if (!startBody || startBody?.base_resp?.ret !== 0) {
-    return new Response(JSON.stringify(startBody || { err: '微信登录接口返回无效响应' }), {
-      status: startResponse.status >= 400 ? startResponse.status : 400,
+    const failure = classifyPasswordLoginFailure(startBody, startResponse.status);
+    return new Response(JSON.stringify({ err: failure.message, code: failure.code }), {
+      status: failure.status,
       headers: { 'Content-Type': 'application/json' },
     });
   }

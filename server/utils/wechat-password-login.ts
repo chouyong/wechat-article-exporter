@@ -53,6 +53,43 @@ export function shouldFollowLegacyLogin(response: unknown): boolean {
   return !!response && typeof response === 'object' && (response as { grey?: unknown }).grey === 0;
 }
 
+export interface PasswordLoginFailure {
+  status: number;
+  message: string;
+  code?: number;
+}
+
+/** 将微信登录错误转换成前端可执行的状态和提示，不暴露原始请求内容。 */
+export function classifyPasswordLoginFailure(response: unknown, upstreamStatus = 400): PasswordLoginFailure {
+  const baseResp = response && typeof response === 'object' ? (response as { base_resp?: unknown }).base_resp : null;
+  const details = baseResp && typeof baseResp === 'object' ? (baseResp as Record<string, unknown>) : {};
+  const rawCode = details.ret;
+  const code = typeof rawCode === 'number' ? rawCode : Number(rawCode);
+  const errMsg = typeof details.err_msg === 'string' ? details.err_msg : '';
+
+  if (code === 200002 || code === 200023) {
+    return {
+      status: 401,
+      code,
+      message: '账号或密码错误，请使用微信公众平台的邮箱或微信号登录；手机号不能作为登录账号。',
+    };
+  }
+
+  if (code === 200008) {
+    return { status: 409, code, message: '微信要求完成验证码或安全确认，请改用二维码登录。' };
+  }
+
+  if (code === 200007 || code === 200138) {
+    return { status: 429, code, message: '微信暂时限制了登录请求，请稍后再试或改用二维码登录。' };
+  }
+
+  return {
+    status: upstreamStatus >= 400 ? upstreamStatus : 502,
+    ...(Number.isFinite(code) ? { code } : {}),
+    message: errMsg || '微信登录接口返回无效响应，请改用二维码登录。',
+  };
+}
+
 /** 把登录流程中微信返回的 Set-Cookie 合并进下一跳请求，不保留 Path 等属性。 */
 export function mergeCookieHeaders(baseCookie: string, setCookies: readonly string[]): string {
   const cookies = new Map<string, string>();

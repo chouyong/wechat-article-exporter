@@ -221,7 +221,7 @@ async function passwordLogin() {
 
       <form v-else class="space-y-4" @submit.prevent="passwordLogin">
         <UFormGroup label="账号" name="username">
-          <UInput v-model="username" autocomplete="username" placeholder="邮箱或微信公众平台账号" :disabled="loading" />
+          <UInput v-model="username" autocomplete="username" placeholder="邮箱或微信号（不支持手机号）" :disabled="loading" />
         </UFormGroup>
         <UFormGroup label="密码" name="password">
           <UInput
@@ -232,7 +232,7 @@ async function passwordLogin() {
             :disabled="loading"
           />
         </UFormGroup>
-        <p class="text-xs text-slate-500">微信要求验证码或安全确认时，请切换为二维码登录完成验证。</p>
+        <p class="text-xs text-slate-500">请输入微信公众平台绑定的邮箱或微信号，不支持手机号；需要验证码时请切换二维码登录。</p>
         <UButton type="submit" block :loading="loading">登录</UButton>
         <p v-if="msg" class="text-rose-500">{{ msg }}</p>
       </form>
