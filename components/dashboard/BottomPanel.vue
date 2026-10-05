@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { formatDistance } from 'date-fns';
-import { setCurrentAccountOwnerKey } from '#shared/utils/account-session';
+import { setCurrentAccountOwnerIdentity } from '#shared/utils/account-session';
 import { request } from '#shared/utils/request';
 import LoginModal from '~/components/modal/Login.vue';
 import StorageUsage from '~/components/StorageUsage.vue';
@@ -21,7 +21,7 @@ const distance = computed(() => {
           if (now.value >= new Date(loginAccount.value.expires)) {
             window.clearInterval(timer);
             setTimeout(() => {
-              setCurrentAccountOwnerKey(null);
+              setCurrentAccountOwnerIdentity(null);
               loginAccount.value = null;
             }, 0);
             return '已过期';
@@ -83,7 +83,7 @@ async function logout() {
   logoutBtnLoading.value = true;
   const { statusCode, statusText } = await request<LogoutResponse>('/api/web/mp/logout');
   if (statusCode === 200) {
-    setCurrentAccountOwnerKey(null);
+    setCurrentAccountOwnerIdentity(null);
     loginAccount.value = null;
   } else {
     alert(statusText);

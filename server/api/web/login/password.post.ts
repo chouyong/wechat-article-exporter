@@ -19,6 +19,7 @@ interface PasswordLoginBody {
 interface LoginAccount {
   nickname: string;
   avatar: string;
+  fakeid: string;
   expires: string;
   err?: string;
 }
@@ -95,16 +96,17 @@ export default defineEventHandler(async event => {
     return errorResponse('登录未完成，请改用二维码登录。', 401);
   }
 
-  const { nick_name, head_img } = await request(`/api/web/mp/info`, {
+  const { nick_name, head_img, fakeid } = await request(`/api/web/mp/info`, {
     headers: { Cookie: `auth-key=${authKey}` },
   });
-  if (!nick_name) {
+  if (!nick_name || !fakeid) {
     return errorResponse('登录成功但无法读取公众号身份，请稍后重试。', 502);
   }
 
   const account: LoginAccount = {
     nickname: nick_name,
     avatar: head_img,
+    fakeid,
     expires: dayjs().add(4, 'days').toString(),
   };
   const responseHeaders = new Headers(finalResponse.headers);

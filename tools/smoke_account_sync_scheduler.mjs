@@ -17,13 +17,32 @@ function check(description, condition) {
 }
 
 check('批量同步固定串行，避免并发触发微信频控', ACCOUNT_SYNC_CONCURRENCY === 1);
-const ownerA = createAccountOwnerKey({ nickname: '一片柳', avatar: 'avatar-a' });
-const ownerB = createAccountOwnerKey({ nickname: '另一账号', avatar: 'avatar-b' });
-check('登录身份生成稳定的本地缓存作用域', ownerA === createAccountOwnerKey({ nickname: '一片柳', avatar: 'avatar-a' }));
+const ownerAIdentity = { nickname: '一片柳', avatar: 'avatar-a', fakeid: 'MzYxMDAwMDAwMA==' };
+const ownerBIdentity = { nickname: '另一账号', avatar: 'avatar-b', fakeid: 'MzYyMDAwMDAwMA==' };
+const ownerA = createAccountOwnerKey(ownerAIdentity);
+const ownerB = createAccountOwnerKey(ownerBIdentity);
+check('登录身份生成稳定的本地缓存作用域', ownerA === createAccountOwnerKey({ ...ownerAIdentity }));
 check('不同登录身份不会共享公众号缓存作用域', ownerA !== ownerB);
-check('同步前拒绝不属于当前登录主体的旧账号行', isAccountOwnedBy({ ownerKey: ownerA }, ownerA));
-check('同步前拒绝缺少主体作用域的旧账号行', !isAccountOwnedBy({ ownerKey: undefined }, ownerA));
-check('同步前拒绝另一个登录主体的账号行', !isAccountOwnedBy({ ownerKey: ownerB }, ownerA));
+check(
+  '同步前允许当前登录主体自己的账号行',
+  isAccountOwnedBy({ ownerKey: ownerA, fakeid: ownerAIdentity.fakeid }, ownerA, ownerAIdentity.fakeid)
+);
+check(
+  '同步前拒绝缺少主体作用域的旧账号行',
+  !isAccountOwnedBy({ ownerKey: undefined, fakeid: ownerAIdentity.fakeid }, ownerA, ownerAIdentity.fakeid)
+);
+check(
+  '同步前拒绝缺少主体 fakeid 的旧账号行',
+  !isAccountOwnedBy({ ownerKey: ownerA, fakeid: ownerAIdentity.fakeid }, ownerA, null)
+);
+check(
+  '同步前拒绝另一个登录主体的账号行',
+  !isAccountOwnedBy({ ownerKey: ownerB, fakeid: ownerBIdentity.fakeid }, ownerA, ownerAIdentity.fakeid)
+);
+check(
+  '同步前拒绝同一作用域下的跨公众号 fakeid',
+  !isAccountOwnedBy({ ownerKey: ownerA, fakeid: ownerBIdentity.fakeid }, ownerA, ownerAIdentity.fakeid)
+);
 check('200013/freq control 被识别为频控', isFrequencyControlError(new Error('200013:freq control')));
 check(
   '频控错误提示包含中文原因和停止重试建议',

@@ -12,7 +12,7 @@ import type {
 import { AgGridVue } from 'ag-grid-vue3';
 import { defu } from 'defu';
 import { createAccountRegistration } from '#shared/utils/account-registration';
-import { createAccountOwnerKey, setCurrentAccountOwnerKey } from '#shared/utils/account-session';
+import { setCurrentAccountOwnerIdentity } from '#shared/utils/account-session';
 import { formatAccountSyncError, runAccountSyncBatch } from '#shared/utils/account-sync';
 import { formatTimeStamp, sleep } from '#shared/utils/helpers';
 import { stripImportedFromQuery } from '#shared/utils/mp-account-import';
@@ -401,7 +401,7 @@ async function refresh() {
 watch(
   loginAccount,
   async account => {
-    setCurrentAccountOwnerKey(account ? createAccountOwnerKey(account) : null);
+    setCurrentAccountOwnerIdentity(account);
     hasSelectedRows.value = false;
     gridApi.value?.deselectAll();
     await refresh();

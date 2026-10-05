@@ -39,20 +39,21 @@ export default defineEventHandler(async event => {
     };
   }
 
-  const { nick_name, head_img } = await request(`/api/web/mp/info`, {
+  const { nick_name, head_img, fakeid } = await request(`/api/web/mp/info`, {
     headers: {
       Cookie: `auth-key=${authKey}`,
     },
   });
-  if (!nick_name) {
+  if (!nick_name || !fakeid) {
     return {
-      err: '获取公众号昵称失败，请稍后重试',
+      err: '获取公众号身份失败，请重新登录后重试',
     };
   }
 
   const body = JSON.stringify({
     nickname: nick_name,
     avatar: head_img,
+    fakeid,
     expires: dayjs().add(4, 'days').toString(),
   });
   const headers = new Headers(response.headers);
