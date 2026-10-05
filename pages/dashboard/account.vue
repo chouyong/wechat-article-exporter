@@ -11,6 +11,7 @@ import type {
 } from 'ag-grid-community';
 import { AgGridVue } from 'ag-grid-vue3';
 import { defu } from 'defu';
+import { createAccountRegistration } from '#shared/utils/account-registration';
 import { createAccountOwnerKey, setCurrentAccountOwnerKey } from '#shared/utils/account-session';
 import { formatAccountSyncError, runAccountSyncBatch } from '#shared/utils/account-sync';
 import { formatTimeStamp, sleep } from '#shared/utils/helpers';
@@ -77,9 +78,10 @@ function addAccount() {
 async function onSelectAccount(account: MpAccount) {
   addBtnLoading.value = true;
   try {
-    await loadAccountArticle(account, false);
+    const registration = createAccountRegistration(account);
+    await importMpAccounts([registration]);
     await refresh();
-    toast.success('公众号添加成功', `已成功添加公众号【${account.nickname}】，并同步了第一页的文章数据`);
+    toast.success('公众号添加成功', `已成功添加公众号【${account.nickname}】，请点击“同步”获取文章数据`);
     // 通知 Credentials 面板按钮立即变更为“已添加”
     accountEventBus.emit('account-added', { fakeid: account.fakeid });
   } catch (error) {
@@ -165,15 +167,17 @@ async function loadAccountArticle(account: MpAccount, loadMore = true) {
   return new Promise((resolve, reject) => {
     const promise: PromiseInstance = { resolve, reject };
 
-    _load(account, 0, loadMore, promise).catch(e => {
-      if (e.message === 'session expired') {
-        modal.open(LoginModal);
-      }
-      reject(e);
-    }).finally(() => {
-      unmarkAccountSyncing(account.fakeid);
-      isSyncing.value = syncingRowIds.value.length > 0;
-    });
+    _load(account, 0, loadMore, promise)
+      .catch(e => {
+        if (e.message === 'session expired') {
+          modal.open(LoginModal);
+        }
+        reject(e);
+      })
+      .finally(() => {
+        unmarkAccountSyncing(account.fakeid);
+        isSyncing.value = syncingRowIds.value.length > 0;
+      });
   });
 }
 
@@ -186,7 +190,11 @@ async function loadSelectedAccountArticle() {
 
   try {
     const rows = getSelectedRows();
-    await runAccountSyncBatch(rows, account => loadAccountArticle(account), () => isCanceled.value);
+    await runAccountSyncBatch(
+      rows,
+      account => loadAccountArticle(account),
+      () => isCanceled.value
+    );
     const rangeHint = isSyncAll() ? '' : `（同步范围：${getSyncRangeLabel()}）`;
     toast.success('同步完成', `已成功同步 ${rows.length} 个公众号${rangeHint}`);
   } catch (e: any) {

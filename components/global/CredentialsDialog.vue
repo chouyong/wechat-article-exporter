@@ -139,12 +139,13 @@
 
 <script setup lang="ts">
 import dayjs from 'dayjs';
+import { createAccountRegistration } from '#shared/utils/account-registration';
 import { getArticleList, getArticleListWithCredential } from '~/apis';
 import LoginModal from '~/components/modal/Login.vue';
 import toastFactory from '~/composables/toast';
 import useLoginCheck from '~/composables/useLoginCheck';
 import { CREDENTIAL_API_HOST, CREDENTIAL_LIVE_MINUTES, isDev } from '~/config';
-import { getInfoCache, type MpAccount } from '~/store/v2/info';
+import { getInfoCache, importMpAccounts } from '~/store/v2/info';
 import type { ParsedCredential } from '~/types/credential';
 
 export type CredentialState = 'active' | 'inactive' | 'warning';
@@ -520,21 +521,19 @@ async function addAccount(credential: ParsedCredential) {
   if (!checkLogin()) return;
 
   addingBiz.value = credential.biz;
-  const nickname = credential.nickname || credential.biz;
-  const account: MpAccount = {
-    fakeid: credential.biz,
-    completed: false,
-    count: 0,
-    articles: 0,
-    total_count: 0,
-    nickname: credential.nickname,
-    round_head_img: credential.avatar,
-  };
 
   try {
-    await getArticleList(account, 0);
+    const account = createAccountRegistration({
+      fakeid: credential.biz,
+      nickname: credential.nickname,
+      round_head_img: credential.avatar,
+    });
+    await importMpAccounts([account]);
     credential.added = true;
-    toast.success('公众号添加成功', `已成功添加公众号【${nickname}】`);
+    toast.success(
+      '公众号添加成功',
+      `已成功添加公众号【${credential.nickname || credential.biz}】，请点击“同步”获取文章数据`
+    );
     // 通知其他视图（如公众号管理列表）立即刷新
     accountEventBus.emit('account-added', { fakeid: credential.biz });
   } catch (error: any) {
