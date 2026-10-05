@@ -32,16 +32,16 @@ check(
   !isAccountOwnedBy({ ownerKey: undefined, fakeid: ownerAIdentity.fakeid }, ownerA, ownerAIdentity.fakeid)
 );
 check(
-  '同步前拒绝缺少主体 fakeid 的旧账号行',
-  !isAccountOwnedBy({ ownerKey: ownerA, fakeid: ownerAIdentity.fakeid }, ownerA, null)
+  '同步前不以登录主体 fakeid 限制目标公众号',
+  isAccountOwnedBy({ ownerKey: ownerA, fakeid: ownerBIdentity.fakeid }, ownerA, null)
 );
 check(
   '同步前拒绝另一个登录主体的账号行',
   !isAccountOwnedBy({ ownerKey: ownerB, fakeid: ownerBIdentity.fakeid }, ownerA, ownerAIdentity.fakeid)
 );
 check(
-  '同步前拒绝同一作用域下的跨公众号 fakeid',
-  !isAccountOwnedBy({ ownerKey: ownerA, fakeid: ownerBIdentity.fakeid }, ownerA, ownerAIdentity.fakeid)
+  '同步前允许同一作用域下的跨公众号 fakeid',
+  isAccountOwnedBy({ ownerKey: ownerA, fakeid: ownerBIdentity.fakeid }, ownerA, ownerAIdentity.fakeid)
 );
 check('200013/freq control 被识别为频控', isFrequencyControlError(new Error('200013:freq control')));
 check(

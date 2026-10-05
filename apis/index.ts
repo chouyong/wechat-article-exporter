@@ -1,8 +1,4 @@
-import {
-  getCurrentAccountOwnerFakeid,
-  getCurrentAccountOwnerKey,
-  isAccountOwnedBy,
-} from '#shared/utils/account-session';
+import { getCurrentAccountOwnerKey, isAccountOwnedBy } from '#shared/utils/account-session';
 import { request } from '#shared/utils/request';
 import { ACCOUNT_LIST_PAGE_SIZE, ARTICLE_LIST_PAGE_SIZE } from '~/config';
 import { updateArticleCache } from '~/store/v2/article';
@@ -34,8 +30,8 @@ export async function getArticleList(
   begin = 0,
   keyword = ''
 ): Promise<[AppMsgEx[], boolean, number]> {
-  if (!isAccountOwnedBy(account, getCurrentAccountOwnerKey(), getCurrentAccountOwnerFakeid())) {
-    throw new Error('当前登录公众号与所选公众号不一致，请切换到对应公众号后再同步');
+  if (!isAccountOwnedBy(account, getCurrentAccountOwnerKey())) {
+    throw new Error('当前登录会话与所选公众号缓存不一致，请重新登录并重新添加该公众号后再同步');
   }
 
   const resp = await request<AppMsgPublishResponse>('/api/web/mp/appmsgpublish', {

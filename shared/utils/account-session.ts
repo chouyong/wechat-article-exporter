@@ -9,7 +9,7 @@
 export interface AccountOwnerIdentity {
   nickname: string;
   avatar: string;
-  /** 当前登录公众号的 fakeid；用于阻止跨公众号会话调用文章接口。 */
+  /** 当前登录主体的 fakeid；用于区分登录作用域，不限制可抓取的目标公众号。 */
   fakeid: string;
 }
 
@@ -49,11 +49,17 @@ export function setCurrentAccountOwnerIdentity(identity: AccountOwnerIdentity | 
   }
 }
 
-/** 只有当前登录主体登记的公众号才允许进入文章同步请求。 */
+/**
+ * 只有当前登录会话登记的公众号才允许进入文章同步请求。
+ *
+ * 登录主体的 fakeid 只用于生成会话作用域。公众号搜索/添加功能支持在同一
+ * 登录会话下选择其他目标公众号，因此不能把目标账号 fakeid 与登录主体
+ * fakeid 强行比较；这里只校验缓存 ownerKey，防止旧登录会话复用缓存。
+ */
 export function isAccountOwnedBy(
   account: AccountOwnerScoped,
   ownerKey: string | null,
-  ownerFakeid: string | null
+  _ownerFakeid?: string | null
 ): boolean {
-  return !!ownerKey && !!ownerFakeid && account.ownerKey === ownerKey && account.fakeid === ownerFakeid;
+  return !!ownerKey && account.ownerKey === ownerKey;
 }

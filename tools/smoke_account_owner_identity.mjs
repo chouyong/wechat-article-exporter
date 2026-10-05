@@ -22,8 +22,8 @@ check(
   isAccountOwnedBy({ ownerKey, fakeid: current.fakeid }, ownerKey, current.fakeid)
 );
 check(
-  '同一昵称头像但不同 fakeid 也必须被阻断',
-  !isAccountOwnedBy({ ownerKey, fakeid: 'MzYyMDAwMDAwMA==' }, ownerKey, current.fakeid)
+  '同一登录作用域下可以同步另一个目标公众号',
+  isAccountOwnedBy({ ownerKey, fakeid: 'MzYyMDAwMDAwMA==' }, ownerKey, current.fakeid)
 );
 check(
   '旧主体作用域必须被阻断',
@@ -49,7 +49,7 @@ check('从公众号主页解析 fakeid', parsed.fakeid === current.fakeid);
 let articleRequests = 0;
 function syncAccount(account, ownerIdentity) {
   if (!isAccountOwnedBy(account, ownerIdentity.ownerKey, ownerIdentity.fakeid)) {
-    throw new Error('当前登录公众号与所选公众号不一致，请切换到对应公众号后再同步');
+    throw new Error('当前登录会话与所选公众号缓存不一致，请重新登录并重新添加该公众号后再同步');
   }
   articleRequests += 1;
 }
@@ -57,11 +57,17 @@ function syncAccount(account, ownerIdentity) {
 const currentOwner = { ...current, ownerKey };
 
 assert.throws(
-  () => syncAccount({ ownerKey, fakeid: 'MzYyMDAwMDAwMA==' }, currentOwner),
-  /当前登录公众号与所选公众号不一致/
+  () =>
+    syncAccount(
+      { ownerKey: createAccountOwnerKey({ ...current, fakeid: 'MzYyMDAwMDAwMA==' }), fakeid: current.fakeid },
+      currentOwner
+    ),
+  /当前登录会话与所选公众号缓存不一致/
 );
 check('跨主体阻断发生在文章接口之前', articleRequests === 0);
+syncAccount({ ownerKey, fakeid: 'MzYyMDAwMDAwMA==' }, currentOwner);
+check('同一登录作用域的目标公众号不会被错误阻断', articleRequests === 1);
 syncAccount({ ownerKey, fakeid: current.fakeid }, currentOwner);
-check('主体一致时才允许进入文章接口', articleRequests === 1);
+check('登录主体公众号也允许进入文章接口', articleRequests === 2);
 
 console.log(`✅ smoke_account_owner_identity: ${passed} 项断言全部通过`);
