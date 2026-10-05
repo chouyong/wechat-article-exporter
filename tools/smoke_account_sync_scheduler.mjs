@@ -7,7 +7,7 @@ const mod = await import('../shared/utils/account-sync.ts');
 const session = await import('../shared/utils/account-session.ts');
 const registration = await import('../shared/utils/account-registration.ts');
 const { ACCOUNT_SYNC_CONCURRENCY, formatAccountSyncError, isFrequencyControlError, runAccountSyncBatch } = mod;
-const { createAccountOwnerKey } = session;
+const { createAccountOwnerKey, isAccountOwnedBy } = session;
 const { createAccountRegistration } = registration;
 
 let passed = 0;
@@ -21,6 +21,9 @@ const ownerA = createAccountOwnerKey({ nickname: '一片柳', avatar: 'avatar-a'
 const ownerB = createAccountOwnerKey({ nickname: '另一账号', avatar: 'avatar-b' });
 check('登录身份生成稳定的本地缓存作用域', ownerA === createAccountOwnerKey({ nickname: '一片柳', avatar: 'avatar-a' }));
 check('不同登录身份不会共享公众号缓存作用域', ownerA !== ownerB);
+check('同步前拒绝不属于当前登录主体的旧账号行', isAccountOwnedBy({ ownerKey: ownerA }, ownerA));
+check('同步前拒绝缺少主体作用域的旧账号行', !isAccountOwnedBy({ ownerKey: undefined }, ownerA));
+check('同步前拒绝另一个登录主体的账号行', !isAccountOwnedBy({ ownerKey: ownerB }, ownerA));
 check('200013/freq control 被识别为频控', isFrequencyControlError(new Error('200013:freq control')));
 check(
   '频控错误提示包含中文原因和停止重试建议',
