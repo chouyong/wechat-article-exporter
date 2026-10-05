@@ -7,7 +7,7 @@ services:
         VERSION: 2.3.17
         BUILD_IMAGE: ccr.ccs.tencentyun.com/buildingai/node:22.20.0
         RUNTIME_IMAGE: ccr.ccs.tencentyun.com/buildingai/node:22.20.0
-    image: wechat-article-exporter:release-bb281e1-20261005
+    image: wechat-article-exporter:release-6757f19b-20261005
     container_name: wechat-article-exporter
     ports:
       - '3001:3000'
