@@ -11,6 +11,10 @@ export interface AccountOwnerIdentity {
   avatar: string;
 }
 
+export interface AccountOwnerScoped {
+  ownerKey?: string;
+}
+
 export const ACCOUNT_OWNER_STORAGE_KEY = 'wechat-article-exporter:account-owner:v1';
 
 export function createAccountOwnerKey(identity: AccountOwnerIdentity): string {
@@ -30,4 +34,9 @@ export function setCurrentAccountOwnerKey(ownerKey: string | null): void {
   } else {
     localStorage.removeItem(ACCOUNT_OWNER_STORAGE_KEY);
   }
+}
+
+/** 只有当前登录主体登记的公众号才允许进入文章同步请求。 */
+export function isAccountOwnedBy(account: AccountOwnerScoped, ownerKey: string | null): boolean {
+  return !!ownerKey && account.ownerKey === ownerKey;
 }

@@ -47,7 +47,7 @@ export async function proxyMpRequest(options: RequestOptions) {
 
   // 记录请求报文
   const requestId = uuidv4().replace(/-/g, '');
-  if (process.env.NUXT_DEBUG_MP_REQUEST && isDev) {
+  if (process.env.NUXT_DEBUG_MP_REQUEST && isDev && !options.sensitive) {
     await logRequest(requestId, request.clone());
   }
 
@@ -55,7 +55,7 @@ export async function proxyMpRequest(options: RequestOptions) {
   const mpResponse = await fetch(request);
 
   // 记录响应报文
-  if (process.env.NUXT_DEBUG_MP_REQUEST && isDev) {
+  if (process.env.NUXT_DEBUG_MP_REQUEST && isDev && !options.sensitive) {
     await logResponse(requestId, mpResponse.clone());
   }
 
@@ -71,41 +71,7 @@ export async function proxyMpRequest(options: RequestOptions) {
   // 只有登录请求才会将 Cookie 数据写入 CookieStore
   // 返回给客户端的一个 auth-key 的 cookie
   else if (options.action === 'login') {
-    // 提取出 token 和 cookies
-    try {
-      const authKey = crypto.randomUUID().replace(/-/g, '');
-
-      const body = await mpResponse.clone().json();
-      const redirectUrl = body?.redirect_url;
-      if (!redirectUrl || typeof redirectUrl !== 'string') {
-        throw new Error(`登录响应中未找到 redirect_url，响应内容: ${JSON.stringify(body)}`);
-      }
-
-      const token = new URL(`http://localhost${redirectUrl}`).searchParams.get('token');
-      if (!token) {
-        throw new Error(`redirect_url 中未找到 token 参数: ${redirectUrl}`);
-      }
-
-      const success = await cookieStore.setCookie(authKey, token, mpResponse.headers.getSetCookie());
-      if (!success) {
-        throw new Error('cookie 写入 KV 存储失败');
-      }
-
-      setCookies = [
-        `auth-key=${authKey}; Path=/; Expires=${dayjs().add(4, 'days').toString()}; Secure; HttpOnly`,
-
-        // 登录成功后，删除浏览器的 uuid cookie
-        `uuid=EXPIRED; Path=/; Expires=${dayjs().subtract(1, 'days').toString()}; Secure; HttpOnly`,
-      ];
-    } catch (error) {
-      console.error('action(login) failed:', error instanceof Error ? error.name : 'unknown_error');
-
-      // 登录失败时返回错误响应，而不是静默继续
-      return new Response(JSON.stringify({ base_resp: { ret: -1, err_msg: '登录处理失败' } }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }
+    return finalizeMpLoginResponse(mpResponse);
   }
 
   // 处理切换公众号的请求
@@ -139,6 +105,55 @@ export async function proxyMpRequest(options: RequestOptions) {
     return finalResponse;
   } else {
     return finalResponse.json();
+  }
+}
+
+/**
+ * 完成微信登录响应的凭据落盘和 auth-key 响应封装。
+ * 账号密码登录存在 startlogin → loginhook=4 两跳，第一跳不应直接写入凭据，
+ * 因此将这段逻辑单独导出给两种登录流程共同使用。
+ */
+export async function finalizeMpLoginResponse(mpResponse: Response): Promise<Response> {
+  try {
+    const authKey = crypto.randomUUID().replace(/-/g, '');
+    const body = await mpResponse.clone().json();
+    const redirectUrl = body?.redirect_url;
+    if (!redirectUrl || typeof redirectUrl !== 'string') {
+      throw new Error('登录响应缺少 redirect_url');
+    }
+
+    const token = new URL(`http://localhost${redirectUrl}`).searchParams.get('token');
+    if (!token) {
+      throw new Error('登录响应缺少 token');
+    }
+
+    const success = await cookieStore.setCookie(authKey, token, mpResponse.headers.getSetCookie());
+    if (!success) {
+      throw new Error('cookie 写入 KV 存储失败');
+    }
+
+    const responseHeaders = new Headers(mpResponse.headers);
+    responseHeaders.delete('set-cookie');
+    responseHeaders.append(
+      'set-cookie',
+      `auth-key=${authKey}; Path=/; Expires=${dayjs().add(4, 'days').toString()}; Secure; HttpOnly`
+    );
+    responseHeaders.append(
+      'set-cookie',
+      `uuid=EXPIRED; Path=/; Expires=${dayjs().subtract(1, 'days').toString()}; Secure; HttpOnly`
+    );
+
+    return new Response(mpResponse.body, {
+      status: mpResponse.status,
+      statusText: mpResponse.statusText,
+      headers: responseHeaders,
+    });
+  } catch (error) {
+    console.error('登录处理失败:', error instanceof Error ? error.name : 'unknown_error');
+    return new Response(JSON.stringify({ base_resp: { ret: -1, err_msg: '登录处理失败' } }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' },
+    });
   }
 }
 

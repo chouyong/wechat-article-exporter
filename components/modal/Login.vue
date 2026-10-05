@@ -10,6 +10,9 @@ const loading = ref(false);
 const msg = ref('');
 
 const checkTimer = ref<number | null>(null);
+const loginMode = ref<'qrcode' | 'password'>('qrcode');
+const username = ref('');
+const password = ref('');
 
 const loginAccount = useLoginAccount();
 
@@ -22,6 +25,18 @@ function closeModal() {
 
   window.clearTimeout(checkTimer.value!);
   checkTimer.value = null;
+  password.value = '';
+}
+
+function switchLoginMode(mode: 'qrcode' | 'password') {
+  loginMode.value = mode;
+  msg.value = '';
+  qrcodeSrc.value = '';
+  window.clearTimeout(checkTimer.value!);
+  checkTimer.value = null;
+  if (mode === 'qrcode') {
+    getQrcode();
+  }
 }
 
 /**
@@ -126,6 +141,43 @@ async function bizLogin() {
     loading.value = false;
   }
 }
+
+async function passwordLogin() {
+  if (!username.value.trim()) {
+    msg.value = '请输入账号';
+    return;
+  }
+  if (!password.value) {
+    msg.value = '请输入密码';
+    return;
+  }
+
+  try {
+    loading.value = true;
+    msg.value = '正在登录';
+    const resp = await request<LoginAccount>('/api/web/login/password', {
+      method: 'POST',
+      body: {
+        username: username.value,
+        password: password.value,
+      },
+    });
+    if (resp.err) {
+      throw new Error(resp.err);
+    }
+
+    setCurrentAccountOwnerKey(createAccountOwnerKey(resp));
+    loginAccount.value = resp;
+    password.value = '';
+    msg.value = '登录成功';
+    closeModal();
+  } catch (e: any) {
+    password.value = '';
+    msg.value = e?.message || '账号密码登录失败，请改用二维码登录';
+  } finally {
+    loading.value = false;
+  }
+}
 </script>
 
 <template>
@@ -143,12 +195,47 @@ async function bizLogin() {
         />
       </template>
 
+      <div class="mb-4 flex gap-2">
+        <UButton
+          :variant="loginMode === 'qrcode' ? 'solid' : 'soft'"
+          :disabled="loading"
+          @click="switchLoginMode('qrcode')"
+        >
+          扫描二维码
+        </UButton>
+        <UButton
+          :variant="loginMode === 'password' ? 'solid' : 'soft'"
+          :disabled="loading"
+          @click="switchLoginMode('password')"
+        >
+          账号密码
+        </UButton>
+      </div>
+
       <!-- 二维码图片展示区 -->
-      <div class="flex flex-col justify-center items-center mx-auto size-80">
+      <div v-if="loginMode === 'qrcode'" class="flex flex-col justify-center items-center mx-auto size-80">
         <UIcon v-if="loading" name="i-lucide:loader" :size="28" class="animate-spin text-slate-500" />
         <p v-if="msg" class="text-rose-500">{{ msg }}</p>
-        <img v-if="qrcodeSrc" :src="qrcodeSrc" alt="" class="w-full rounded-md" />
+        <img v-if="qrcodeSrc" :src="qrcodeSrc" alt="微信公众平台登录二维码" class="w-full rounded-md" />
       </div>
+
+      <form v-else class="space-y-4" @submit.prevent="passwordLogin">
+        <UFormGroup label="账号" name="username">
+          <UInput v-model="username" autocomplete="username" placeholder="邮箱或微信公众平台账号" :disabled="loading" />
+        </UFormGroup>
+        <UFormGroup label="密码" name="password">
+          <UInput
+            v-model="password"
+            type="password"
+            autocomplete="current-password"
+            placeholder="请输入密码"
+            :disabled="loading"
+          />
+        </UFormGroup>
+        <p class="text-xs text-slate-500">微信要求验证码或安全确认时，请切换为二维码登录完成验证。</p>
+        <UButton type="submit" block :loading="loading">登录</UButton>
+        <p v-if="msg" class="text-rose-500">{{ msg }}</p>
+      </form>
     </UCard>
   </UModal>
 </template>

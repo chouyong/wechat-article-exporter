@@ -19,7 +19,10 @@ function check(description, condition) {
 }
 
 check('微信密码使用 UTF-8 MD5 摘要', hashWechatPassword('password') === '5f4dcc3b5aa765d61d8327deb882cf99');
-check('微信密码最多取前 16 个字符', hashWechatPassword('1234567890123456-extra') === hashWechatPassword('1234567890123456'));
+check(
+  '微信密码最多取前 16 个字符',
+  hashWechatPassword('1234567890123456-extra') === hashWechatPassword('1234567890123456')
+);
 
 const payload = buildPasswordLoginPayload({
   username: 'owner@example.com',
@@ -28,7 +31,10 @@ const payload = buildPasswordLoginPayload({
   randStr: 'rand',
 });
 check('账号密码请求包含官方字段', payload.username === 'owner@example.com' && payload.verify_ticket === 'ticket');
-check('请求体不包含明文密码字段', !Object.prototype.hasOwnProperty.call(payload, 'password') && !JSON.stringify(payload).includes('secret-value'));
+check(
+  '请求体不包含明文密码字段',
+  !Object.prototype.hasOwnProperty.call(payload, 'password') && !JSON.stringify(payload).includes('secret-value')
+);
 check('请求体密码字段是摘要', payload.pwd === hashWechatPassword('secret-value'));
 check('密码长度上限与官方流程一致', WECHAT_PASSWORD_MAX_LENGTH === 16);
 check('灰度标记为 0 时进入旧登录提交', shouldFollowLegacyLogin({ grey: 0 }) === true);
