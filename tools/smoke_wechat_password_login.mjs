@@ -4,6 +4,7 @@
 import assert from 'node:assert/strict';
 
 const mod = await import('../server/utils/wechat-password-login.ts');
+const errorMod = await import('../shared/utils/login-error.ts');
 const {
   WECHAT_PASSWORD_MAX_LENGTH,
   buildPasswordLoginPayload,
@@ -12,6 +13,7 @@ const {
   classifyPasswordLoginFailure,
   shouldFollowLegacyLogin,
 } = mod;
+const { getLoginErrorMessage } = errorMod;
 
 let passed = 0;
 function check(description, condition) {
@@ -58,5 +60,28 @@ check('登录响应 Cookie 覆盖同名旧值并保留新值', merged === 'uuid=
 assert.throws(() => buildPasswordLoginPayload({ username: '', password: 'secret' }), /账号不能为空/);
 assert.throws(() => buildPasswordLoginPayload({ username: 'owner', password: '' }), /密码不能为空/);
 check('账号和密码输入校验失败关闭', true);
+
+check(
+  '优先展示 401 响应体中的业务错误',
+  getLoginErrorMessage(
+    { status: 401, data: { err: '账号或密码错误，请使用绑定邮箱或微信号。' }, message: '401 Unauthorized' },
+    '账号密码登录失败，请改用二维码登录'
+  ).includes('账号或密码错误')
+);
+check(
+  '兼容 $fetch response._data 中的业务错误',
+  getLoginErrorMessage(
+    {
+      response: { status: 409, _data: { err: '微信要求完成验证码或安全确认，请改用二维码登录。' } },
+      message: '409 Conflict',
+    },
+    '账号密码登录失败，请改用二维码登录'
+  ).includes('验证码或安全确认')
+);
+check(
+  '没有业务错误时才回退到异常消息',
+  getLoginErrorMessage({ message: '网络连接失败' }, '默认登录失败提示') === '网络连接失败'
+);
+check('没有任何错误信息时使用默认提示', getLoginErrorMessage({}, '默认登录失败提示') === '默认登录失败提示');
 
 console.log(`✅ smoke_wechat_password_login: ${passed} 项断言全部通过`);

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { setCurrentAccountOwnerIdentity } from '#shared/utils/account-session';
+import { getLoginErrorMessage } from '#shared/utils/login-error';
 import { request } from '#shared/utils/request';
 import type { LoginAccount, ScanLoginResult, StartLoginResult } from '~/types/types';
 
@@ -173,7 +174,7 @@ async function passwordLogin() {
     closeModal();
   } catch (e: any) {
     password.value = '';
-    msg.value = e?.message || '账号密码登录失败，请改用二维码登录';
+    msg.value = getLoginErrorMessage(e, '账号密码登录失败，请改用二维码登录');
   } finally {
     loading.value = false;
   }
