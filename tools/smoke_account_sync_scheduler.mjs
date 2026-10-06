@@ -4,9 +4,11 @@
 import assert from 'node:assert/strict';
 
 const mod = await import('../shared/utils/account-sync.ts');
+const params = await import('../server/utils/mp-appmsgpublish-params.ts');
 const session = await import('../shared/utils/account-session.ts');
 const registration = await import('../shared/utils/account-registration.ts');
 const { ACCOUNT_SYNC_CONCURRENCY, formatAccountSyncError, isFrequencyControlError, runAccountSyncBatch } = mod;
+const { buildAppmsgpublishParams } = params;
 const { createAccountOwnerKey, isAccountOwnedBy } = session;
 const { createAccountRegistration } = registration;
 
@@ -50,6 +52,22 @@ check(
     /停止/.test(formatAccountSyncError(new Error('200013:freq control'))) &&
     /稍后/.test(formatAccountSyncError(new Error('200013:freq control')))
 );
+check(
+  '频控提示明确是当前登录会话的文章接口限制',
+  /当前登录会话/.test(formatAccountSyncError(new Error('200013:freq control'))) &&
+    /不代表.*已同步过文章/.test(formatAccountSyncError(new Error('200013:freq control')))
+);
+
+const requestParams = buildAppmsgpublishParams({
+  fakeid: ' target-fakeid ',
+  token: 'session-token',
+  begin: 0,
+  size: 20,
+});
+check('文章请求保留所选目标公众号 fakeid', requestParams.fakeid === 'target-fakeid');
+check('文章列表请求使用稳定的 list search_field', requestParams.search_field === '7');
+check('文章请求不会把 undefined 作为 query 参数发送', requestParams.query === '');
+assert.throws(() => buildAppmsgpublishParams({ fakeid: ' ', token: 'session-token' }), /fakeid/);
 
 const addedAccount = createAccountRegistration({
   fakeid: 'fakeid-new-account',
