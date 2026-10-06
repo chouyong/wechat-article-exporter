@@ -26,3 +26,12 @@
 - 发布：提交 `1f1372d0eebb31891330746cf162b6e7f1a9481c` 已推送并 fetch-back 与 `origin/master` 一致。
 - 3019 隔离候选曾验证通过（API JSON、账号密码空请求 400、bundle 新文案），随后已删除候选容器、镜像、独立 exports 和临时 Dockerfile；正式 3001 未切换。
 - 正式切换阻断：`data/exports/article-library/jobs` 中 5 个历史 `job.json` 含重复 JSON 尾部；3001 对这 5 个 ID 均返回 `found:false`，无法证明合法终态，未修改 job、快照、账号、调度或生产镜像。
+
+## 2026-10-06 继续收口 owner 作用域修复
+
+- 只读刷新确认 3001 仍为 `wechat-article-exporter:release-6757f19b-20261005`，端口 `3001→3000`，仅一个 Node 主进程，`kb-wechat-sync` 仍 Disabled。
+- 快照仍为 401 个账号、13022 篇文章，SHA-256=`576EC47E13274D702BCB4E1415E70F6A0FECC1D5DACE2C3B64E76FDAA857E0BE`；未运行真实同步、未读取认证秘密。
+- 重新核对 5 个历史 job 的原始 SHA 与重复尾部；3001 API 对每个 ID 均返回 `found:false`，因此不猜造终态。
+- 在干净 `HEAD=10dd35244dd282d25c1ace043ce24f539e120be1` 上重新执行 `yarn build`，Nuxt/Nitro production build 通过；下一步是候选镜像真实 Edge CSR 验证和生产切换门禁复核。
+- 候选 `candidate-10dd352-owner-scope-20261006-r2` 已在 3019 通过 HTTP JSON 与真实 Edge CSR：dashboard DOM 正常、无 Nuxt 错误页、无 pageerror/失败资源；登录弹窗可切换二维码与账号密码模式。
+- 5 个历史 job 先按原 SHA 备份到 `D:\\tmp\\wechat-job-repair-backup-20261006`，再仅去除首个完整 JSON 后的重复尾部，保留原对象、status 与计数；修复后全部严格 JSON，快照 SHA 仍未变化。原始备份作为回滚副本保留。
