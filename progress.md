@@ -35,3 +35,12 @@
 - 在干净 `HEAD=10dd35244dd282d25c1ace043ce24f539e120be1` 上重新执行 `yarn build`，Nuxt/Nitro production build 通过；下一步是候选镜像真实 Edge CSR 验证和生产切换门禁复核。
 - 候选 `candidate-10dd352-owner-scope-20261006-r2` 已在 3019 通过 HTTP JSON 与真实 Edge CSR：dashboard DOM 正常、无 Nuxt 错误页、无 pageerror/失败资源；登录弹窗可切换二维码与账号密码模式。
 - 5 个历史 job 先按原 SHA 备份到 `D:\\tmp\\wechat-job-repair-backup-20261006`，再仅去除首个完整 JSON 后的重复尾部，保留原对象、status 与计数；修复后全部严格 JSON，快照 SHA 仍未变化。原始备份作为回滚副本保留。
+
+## 2026-10-06 3001 正式切换收口
+
+- Compose 发布提交 `115fff1c5a2b729482d9ffdf7f079b4c8c844f2f` 已推送 `origin/master`，fetch-back 后本地与远端一致；镜像映射为 `release-10dd352-20261006`。
+- 正式容器 `wechat-article-exporter` 已由 Compose 重建：端口 `3001→3000`、restart=`unless-stopped`、正式 KV/exports 可写、RSS 只读、仅一个 Node 主进程；运行镜像 `sha256:a6b231b8439d941205a6ab58a324ff068e9bea426bda0fd8c319aadb8412ad73`，`io.codex.revision=10dd35244dd282d25c1ace043ce24f539e120be1`。
+- 3001 HTTP 与全新 Edge CSR 均通过：dashboard DOM 正常、无 Nuxt 错误页、无失败资源和 pageerror；未登录 `mp/info/searchbiz` 为合法 JSON，账号密码空参数为 HTTP 400 JSON。
+- 启动恢复读取修复后的历史任务：4 个遗留 `running` 变为服务重启中断的 `failed`，1 个原 `completed` 保持 completed；API 对 5 个 ID 均返回 `found=true`，计数/失败样本保留。未执行真实同步，`kb-wechat-sync` 仍 Disabled。
+- 快照仍为 401 个账号、13022 篇文章、7011218 字节，SHA-256=`576EC47E13274D702BCB4E1415E70F6A0FECC1D5DACE2C3B64E76FDAA857E0BE`；旧镜像精确回滚标签为 `wechat-article-exporter:rollback-before-owner-scope-10dd352-20261006`（`sha256:3388d5394e61a697170027989dd8bb43271fedc1924fb5f74a0ac70f41e143cc`）。
+- 本轮候选容器、候选镜像标签、overlay、独立 exports 和浏览器 profile 已精确删除；5 个原始损坏 job 备份按原 SHA 保留在 `D:\\tmp\\wechat-job-repair-backup-20261006`，用于回滚。
