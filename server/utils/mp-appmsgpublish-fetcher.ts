@@ -1,3 +1,4 @@
+import { buildAppmsgpublishParams } from './mp-appmsgpublish-params.ts';
 import { classifyAppmsgpublishError, parseAppmsgpublishResponse } from './mp-appmsgpublish-parse.ts';
 import type { PageFetcher } from './mp-sync-service.ts';
 
@@ -29,21 +30,14 @@ export function createAppmsgpublishPageFetcher(options: AppmsgpublishFetcherOpti
     if (!cookie || !token) {
       throw classifyAppmsgpublishError({ httpStatus: 401 });
     }
-    const query = new URLSearchParams({
-      sub: 'list',
-      search_field: '7',
-      begin: String(begin),
-      count: String(size),
-      query: '',
-      fakeid,
-      type: '101_1',
-      free_publish_type: '1',
-      sub_action: 'list_ex',
-      token,
-      lang: 'zh_CN',
-      f: 'json',
-      ajax: '1',
-    });
+    const query = new URLSearchParams(
+      Object.fromEntries(
+        Object.entries(buildAppmsgpublishParams({ fakeid, token, begin, size })).map(([key, value]) => [
+          key,
+          String(value),
+        ])
+      )
+    );
     let response: Response;
     try {
       response = await fetchImpl(`${ENDPOINT}?${query.toString()}`, {

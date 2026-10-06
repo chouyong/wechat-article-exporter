@@ -3,13 +3,14 @@
  */
 
 import { getTokenFromStore } from '~/server/utils/CookieStore';
+import { buildAppmsgpublishParams } from '~/server/utils/mp-appmsgpublish-params';
 import { proxyMpRequest } from '~/server/utils/proxy-request';
 
 interface AppMsgPublishQuery {
-  begin?: number;
-  size?: number;
-  id: string;
-  keyword: string;
+  begin?: number | string;
+  size?: number | string;
+  id?: string;
+  keyword?: string;
 }
 
 export default defineEventHandler(async event => {
@@ -19,28 +20,23 @@ export default defineEventHandler(async event => {
   }
 
   const query = getQuery<AppMsgPublishQuery>(event);
-  const id = query.id;
-  const keyword = query.keyword;
-  const begin: number = query.begin || 0;
-  const size: number = query.size || 5;
-
-  const isSearching = !!keyword;
-
-  const params: Record<string, string | number> = {
-    sub: isSearching ? 'search' : 'list',
-    search_field: isSearching ? '7' : 'null',
-    begin: begin,
-    count: size,
-    query: keyword,
-    fakeid: id,
-    type: '101_1',
-    free_publish_type: 1,
-    sub_action: 'list_ex',
-    token: token,
-    lang: 'zh_CN',
-    f: 'json',
-    ajax: 1,
-  };
+  let params: Record<string, string | number>;
+  try {
+    params = buildAppmsgpublishParams({
+      fakeid: query.id ?? '',
+      token,
+      begin: query.begin,
+      size: query.size,
+      keyword: query.keyword,
+    });
+  } catch (error) {
+    return {
+      base_resp: {
+        ret: -1,
+        err_msg: error instanceof Error ? error.message : '文章列表请求参数无效',
+      },
+    };
+  }
 
   return proxyMpRequest({
     event: event,

@@ -47,8 +47,8 @@ check(
 );
 check('200013/freq control 被识别为频控', isFrequencyControlError(new Error('200013:freq control')));
 check(
-  '频控错误提示包含中文原因和停止重试建议',
-  /频控/.test(formatAccountSyncError(new Error('200013:freq control'))) &&
+  '频控错误提示包含接口限制原因和停止重试建议',
+  /限制/.test(formatAccountSyncError(new Error('200013:freq control'))) &&
     /停止/.test(formatAccountSyncError(new Error('200013:freq control'))) &&
     /稍后/.test(formatAccountSyncError(new Error('200013:freq control')))
 );
@@ -61,8 +61,8 @@ check(
 const requestParams = buildAppmsgpublishParams({
   fakeid: ' target-fakeid ',
   token: 'session-token',
-  begin: 0,
-  size: 20,
+  begin: '0',
+  size: '20',
 });
 check('文章请求保留所选目标公众号 fakeid', requestParams.fakeid === 'target-fakeid');
 check('文章列表请求使用稳定的 list search_field', requestParams.search_field === '7');

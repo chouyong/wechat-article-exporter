@@ -18,7 +18,7 @@ export function isFrequencyControlError(error: unknown): boolean {
 /** 把底层错误转换成用户可执行的提示；未知错误保留原始短消息用于排查。 */
 export function formatAccountSyncError(error: unknown): string {
   if (isFrequencyControlError(error)) {
-    return '微信接口暂时触发频控（200013），本次同步已停止。请稍后再重试（建议等待几分钟），避免连续点击同步。';
+    return '微信文章接口限制了当前登录会话（ret=200013），这不代表所选公众号已同步过文章。本次同步已停止，请稍后等待上游解除限制后再试；连续重试或立即重新登录通常不会立刻解除该限制。';
   }
 
   const message = error instanceof Error ? error.message.trim() : String(error ?? '').trim();
